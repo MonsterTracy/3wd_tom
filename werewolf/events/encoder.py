@@ -1,6 +1,9 @@
-"""Encode unified structured events into model-native integer tokens."""
+"""Encode canonical structured events into model-native integer tokens."""
 
-from werewolf.events.schema import event_sort_key, validate_event
+from werewolf.events.schema import CONTENT_VALUES_BY_KIND, event_sort_key
+
+
+ENCODER_SCHEMA_VERSION = "structured_event.v1_1"
 
 
 EVENT_TOKEN_FIELDS = (
@@ -57,22 +60,23 @@ KIND2ID = {
 VALUE2ID = {
     "PAD": 0,
     "UNKNOWN": 1,
-    "Werewolf": 2,
-    "Seer": 3,
-    "Witch": 4,
-    "Guard": 5,
-    "Villager": 6,
-    "Village": 7,
-    "good": 8,
-    "bad": 9,
-    "VOTE": 10,
-    "PASS": 11,
-    "support": 12,
-    "challenge": 13,
-    "question": 14,
-    "retract": 15,
-    "win": 16,
-    "lose": 17,
+    "NONE": 2,
+    "Werewolf": 3,
+    "Seer": 4,
+    "Witch": 5,
+    "Guard": 6,
+    "Villager": 7,
+    "Village": 8,
+    "VOTE": 9,
+    "PASS": 10,
+    "KILL": 11,
+    "WITCH_HEAL": 12,
+    "WITCH_POISON": 13,
+    "WITCH_PASS": 14,
+    "HEAL_AND_POISON_AVAILABLE": 15,
+    "HEAL_AVAILABLE": 16,
+    "POISON_AVAILABLE": 17,
+    "NO_POTIONS_AVAILABLE": 18,
 }
 POLARITY2ID = {None: 0, "positive": 1, "negative": 2, "neutral": 3}
 CERTAINTY2ID = {None: 0, "weak": 1, "normal": 2, "strong": 3}
@@ -129,19 +133,20 @@ def _phase_name(phase: str) -> str:
     return "init"
 
 
-def _content_value(value):
-    if isinstance(value, str):
+def _content_value(kind, value):
+    """Return a canonical scalar, NONE, or the final UNKNOWN fallback."""
+
+    allowed = CONTENT_VALUES_BY_KIND.get(kind)
+    if allowed is None:
+        return "UNKNOWN"
+    if value is None:
+        return "NONE" if None in allowed else "UNKNOWN"
+    if value in allowed and value in VALUE2ID:
         return value
-    if isinstance(value, dict):
-        for key in ("role", "camp", "result", "action", "status"):
-            candidate = value.get(key)
-            if isinstance(candidate, str):
-                return candidate
     return "UNKNOWN"
 
 
 def encode_event(event: dict) -> list[list[int]]:
-    validate_event(event)
     qualifier = event["qualifier"]
     targets = event["target"] or [0]
     base = {
@@ -150,7 +155,8 @@ def encode_event(event: dict) -> list[list[int]]:
         "speaker_id": event["speaker"],
         "kind_id": KIND2ID.get(event["content"]["kind"], KIND2ID["UNKNOWN"]),
         "value_id": VALUE2ID.get(
-            _content_value(event["content"]["value"]), VALUE2ID["UNKNOWN"]
+            _content_value(event["content"]["kind"], event["content"]["value"]),
+            VALUE2ID["UNKNOWN"],
         ),
         "polarity_id": POLARITY2ID[qualifier["polarity"]],
         "certainty_id": CERTAINTY2ID[qualifier["certainty"]],

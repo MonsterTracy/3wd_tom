@@ -3,20 +3,23 @@ seed: 20260716
 games: 1
 max_steps: 256
 backends:
-  main:
+  deepseek:
     type: openai_compatible
-    base_url: null
-    api_key_env: OPENAI_API_KEY
-    default_model: gpt-4o-mini
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    default_model: deepseek-chat
 parser:
-  backend: main
-  model: gpt-4o-mini
+  backend: deepseek
+  model: deepseek-chat
+guess:
+  backend: deepseek
+  model: deepseek-chat
 agents:
   profiles:
     gameplay:
-      agent_type: gpt4o-mini
-      backend: main
-      model: gpt-4o-mini
+      agent_type: deepseek
+      backend: deepseek
+      model: deepseek-chat
       temperature: 0.7
       strategy: {}
   werewolf_profile: gameplay

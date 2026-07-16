@@ -46,16 +46,17 @@ class BeliefGuessProvider:
         valid_mask = validate_pair_mask(output_mask)
         raw_text = []
         error = None
-        messages = [
+        initial_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": player_view},
         ]
         for attempt in range(1, 3):
-            if attempt == 2:
+            messages = [dict(message) for message in initial_messages]
+            if attempt == 2 and raw_text:
                 messages.append(
                     {
                         "role": "assistant",
-                        "content": raw_text[-1] if raw_text else "",
+                        "content": raw_text[-1],
                     }
                 )
                 messages.append(

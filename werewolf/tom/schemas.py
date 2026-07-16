@@ -24,7 +24,10 @@ COMMON_FIELDS = {
     "task",
     "mode",
     "checkpoint",
+    "checkpoint_scope",
     "state_id",
+    "public_state_id",
+    "source_first_order_sample_id",
     "day",
     "phase",
     "turn",
@@ -71,6 +74,17 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
             raise ValueError(f"{name} is required")
     if sample["task"] not in TASKS:
         raise ValueError("invalid task")
+    if sample["checkpoint_scope"] not in ("public", "private"):
+        raise ValueError("checkpoint_scope must be public or private")
+    if sample["public_state_id"] is not None and (
+        not isinstance(sample["public_state_id"], str) or not sample["public_state_id"]
+    ):
+        raise ValueError("public_state_id must be non-empty text or null")
+    if sample["source_first_order_sample_id"] is not None and (
+        not isinstance(sample["source_first_order_sample_id"], str)
+        or not sample["source_first_order_sample_id"]
+    ):
+        raise ValueError("source_first_order_sample_id must be non-empty text or null")
     if type(sample["day"]) is not int or sample["day"] < 0:
         raise ValueError("day must be a non-negative integer")
     if type(sample["turn"]) is not int or sample["turn"] < 0:
@@ -85,6 +99,13 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
             raise ValueError("first-order samples require observer_id")
         if sample["modeler_id"] is not None or sample["target_id"] is not None:
             raise ValueError("first-order samples cannot set modeler_id or target_id")
+        if sample["source_first_order_sample_id"] is not None:
+            raise ValueError("first-order samples cannot have a source first-order sample")
+        if sample["checkpoint_scope"] == "public":
+            if sample["public_state_id"] != sample["state_id"]:
+                raise ValueError("public first-order state ids must match")
+        elif sample["public_state_id"] is not None:
+            raise ValueError("private checkpoints cannot set public_state_id")
     else:
         if sample["mode"] not in SECOND_ORDER_MODES:
             raise ValueError("invalid second-order mode")
@@ -96,11 +117,19 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
             raise ValueError("public-only samples cannot set modeler_id")
         if sample["mode"] == "wolf_conditioned" and sample["modeler_id"] is None:
             raise ValueError("wolf-conditioned samples require modeler_id")
+        if sample["checkpoint_scope"] != "public":
+            raise ValueError("second-order samples require a public checkpoint")
+        if sample["public_state_id"] != sample["state_id"]:
+            raise ValueError("second-order public_state_id must match state_id")
+        if sample["source_first_order_sample_id"] is None:
+            raise ValueError("second-order samples require source_first_order_sample_id")
 
     if not isinstance(sample["events"], list):
         raise ValueError("events must be a list")
     for event in sample["events"]:
         validate_event(event)
+        if event["turn"] > sample["turn"]:
+            raise ValueError("sample contains a future event after its checkpoint")
     _validate_mask(sample["output_mask"])
 
     if sample["task"] == "first_order":
@@ -138,6 +167,29 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
         modeler_knowledge = knowledge_for_player(sample["events"], modeler_id)
         if modeler_knowledge["role"] != "Werewolf":
             raise ValueError("wolf-conditioned modeler requires a Werewolf SELF_ROLE fact")
+        known_wolves = set(modeler_knowledge["known_wolves"])
+        if len(known_wolves) != 2 or modeler_id not in known_wolves:
+            raise ValueError("wolf-conditioned modeler requires the exact visible wolf team")
+        for event in sample["events"]:
+            if event["visibility"] != "private":
+                continue
+            kind = event["content"]["kind"]
+            if kind == "SELF_ROLE":
+                if event["target"] != [modeler_id] or event["visible_to"] != [modeler_id]:
+                    raise ValueError("wolf-conditioned sample contains a god-view role fact")
+            elif kind == "WOLF_TEAM":
+                if modeler_id not in event["target"] or set(event["visible_to"]) != set(event["target"]):
+                    raise ValueError("wolf-conditioned WOLF_TEAM visibility is inconsistent")
+            elif kind == "PRIVATE_ACTION_RESULT":
+                if (
+                    set(event["visible_to"]) != known_wolves
+                    or event["speaker"] not in known_wolves
+                ):
+                    raise ValueError(
+                        "wolf-conditioned private action visibility is inconsistent"
+                    )
+            else:
+                raise ValueError("wolf-conditioned sample contains target private information")
         expected_mask = second_order_output_mask(
             mode="wolf_conditioned", target_id=sample["target_id"]
         ).tolist()
@@ -186,7 +238,9 @@ def make_sample(
     task,
     mode,
     checkpoint,
+    checkpoint_scope,
     state_id,
+    public_state_id,
     day,
     phase,
     turn,
@@ -196,6 +250,7 @@ def make_sample(
     observer_id=None,
     modeler_id=None,
     target_id=None,
+    source_first_order_sample_id=None,
 ) -> dict:
     pair = guess.pair if guess.status == "ok" else None
     sample = {
@@ -205,7 +260,10 @@ def make_sample(
         "task": task,
         "mode": mode,
         "checkpoint": checkpoint,
+        "checkpoint_scope": checkpoint_scope,
         "state_id": state_id,
+        "public_state_id": public_state_id,
+        "source_first_order_sample_id": source_first_order_sample_id,
         "day": day,
         "phase": phase,
         "turn": turn,
@@ -226,3 +284,65 @@ def make_sample(
     }
     validate_sample(sample, require_success=False)
     return sample
+
+
+def first_order_key(sample):
+    return sample["game_id"], sample["state_id"], sample["observer_id"]
+
+
+def second_order_key(sample):
+    key = (
+        sample["game_id"],
+        sample["public_state_id"],
+        sample["mode"],
+    )
+    if sample["mode"] == "public_only":
+        return (*key, sample["target_id"])
+    return (*key, sample["modeler_id"], sample["target_id"])
+
+
+def validate_sample_collection(samples) -> bool:
+    """Validate global identities and first-to-second-order label provenance."""
+
+    sample_ids = set()
+    first_keys = set()
+    second_keys = set()
+    first_by_id = {}
+    for sample in samples:
+        validate_sample(sample, require_success=False)
+        sample_id = sample["sample_id"]
+        if sample_id in sample_ids:
+            raise ValueError(f"duplicate sample_id: {sample_id}")
+        sample_ids.add(sample_id)
+        if sample["task"] == "first_order":
+            key = first_order_key(sample)
+            if key in first_keys:
+                raise ValueError(f"duplicate first-order key: {key}")
+            first_keys.add(key)
+            first_by_id[sample_id] = sample
+        else:
+            key = second_order_key(sample)
+            if key in second_keys:
+                raise ValueError(f"duplicate second-order key: {key}")
+            second_keys.add(key)
+
+    for sample in samples:
+        if sample["task"] != "second_order":
+            continue
+        source_id = sample["source_first_order_sample_id"]
+        source = first_by_id.get(source_id)
+        if source is None:
+            raise ValueError(f"missing source first-order sample: {source_id}")
+        if source["checkpoint_scope"] != "public":
+            raise ValueError("private checkpoint cannot source a second-order sample")
+        if sample["game_id"] != source["game_id"]:
+            raise ValueError("second-order game_id does not match its source")
+        if sample["public_state_id"] != source["public_state_id"]:
+            raise ValueError("second-order public_state_id does not match its source")
+        if sample["target_id"] != source["observer_id"]:
+            raise ValueError("second-order target_id does not match its source observer")
+        if sample["label_pair"] != source["label_pair"]:
+            raise ValueError("second-order label_pair does not match its source")
+        if sample["label_index"] != source["label_index"]:
+            raise ValueError("second-order label_index does not match its source")
+    return True

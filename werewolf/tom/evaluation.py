@@ -6,10 +6,12 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import MODE_IDS, TASK_IDS, collate_features
 from werewolf.tom.metrics import compute_metrics
 from werewolf.tom.model import ToMModel, ToMModelConfig
+from werewolf.tom.pair_space import WOLF_PAIRS
 from werewolf.tom.training import resolve_device
 
 
@@ -47,6 +49,15 @@ def evaluate_from_config(config):
     checkpoint = torch.load(config["checkpoint"], map_location=device, weights_only=False)
     if checkpoint.get("schema_version") != "model.v1":
         raise ValueError("unsupported checkpoint schema_version")
+    if checkpoint.get("pair_space") != [list(pair) for pair in WOLF_PAIRS]:
+        raise ValueError("checkpoint pair_space does not match the canonical 21 classes")
+    expected_encoder = {
+        "schema_version": ENCODER_SCHEMA_VERSION,
+        "kind_vocabulary": KIND2ID,
+        "value_vocabulary": VALUE2ID,
+    }
+    if checkpoint.get("event_encoder") != expected_encoder:
+        raise ValueError("checkpoint event encoder metadata is incompatible")
     model = ToMModel(ToMModelConfig(**checkpoint["config"]["model"]))
     model.load_state_dict(checkpoint["model_state"])
     model.to(device).eval()

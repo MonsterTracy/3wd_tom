@@ -6,7 +6,7 @@ from pathlib import Path
 from torch.utils.data import Dataset
 
 from werewolf.tom.features import sample_to_features
-from werewolf.tom.schemas import validate_sample
+from werewolf.tom.schemas import validate_sample, validate_sample_collection
 
 
 class ToMDataset(Dataset):
@@ -20,7 +20,7 @@ class ToMDataset(Dataset):
     ):
         if isinstance(paths, (str, Path)):
             paths = [paths]
-        self.records = []
+        records = []
         self.include_first_order_private = include_first_order_private
         for path in paths:
             path = Path(path)
@@ -33,11 +33,17 @@ class ToMDataset(Dataset):
                         validate_sample(record)
                     except (json.JSONDecodeError, ValueError) as exc:
                         raise ValueError(f"{path}:{line_number}: {exc}") from exc
-                    if task is not None and record["task"] != task:
-                        continue
-                    if mode is not None and record["mode"] != mode:
-                        continue
-                    self.records.append(record)
+                    records.append(record)
+        try:
+            validate_sample_collection(records)
+        except ValueError as exc:
+            raise ValueError(f"dataset identity/alignment error: {exc}") from exc
+        self.records = [
+            record
+            for record in records
+            if (task is None or record["task"] == task)
+            and (mode is None or record["mode"] == mode)
+        ]
         if not self.records:
             raise ValueError("dataset contains no matching successful tom.v1 samples")
 

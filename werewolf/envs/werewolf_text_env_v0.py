@@ -159,7 +159,12 @@ class WerewolfTextEnvV0:
 
         self._emit(
             setting_event,
-            value={"roles": dict(Counter(self.roles)), "players": 7, "wolves": 2},
+            value=None,
+            metadata={
+                "roles": dict(Counter(self.roles)),
+                "players": 7,
+                "wolves": 2,
+            },
         )
         for player_id, role in enumerate(self.roles, start=1):
             self._emit(
@@ -172,7 +177,7 @@ class WerewolfTextEnvV0:
             wolf_team_event,
             visible_to=self.wolves,
             target=self.wolves,
-            value={"role": "Werewolf"},
+            value=None,
         )
         self._collect(team_event)
         self._start_night()
@@ -201,8 +206,8 @@ class WerewolfTextEnvV0:
         elif self.phase in ("speech", "speech_pk"):
             self._speech_action(action_type, action_value)
         elif self.phase in ("vote", "vote_pk"):
-            self._vote_action(action_type, action_value)
-            if not self.vote_queue:
+            round_complete = self._vote_action(action_type, action_value)
+            if round_complete:
                 reward, done, info = self._end_vote()
         else:
             raise RuntimeError(f"unknown phase: {self.phase}")
@@ -245,7 +250,8 @@ class WerewolfTextEnvV0:
             visible_to=self.wolves,
             speaker=self.current_player,
             target=target or None,
-            value={"action": "KILL", "status": "pass" if target == 0 else "chosen"},
+            value="KILL",
+            metadata={"status": "pass" if target == 0 else "chosen"},
         )
 
     def _advance_after_wolf(self):
@@ -274,12 +280,10 @@ class WerewolfTextEnvV0:
             visible_to=[self.seer],
             speaker=self.seer,
             target=target or None,
-            value={
-                "camp": (
-                    "Werewolf" if target and self._role(target) == "Werewolf" else
-                    "Village" if target else "unknown"
-                )
-            },
+            value=(
+                "Werewolf" if target and self._role(target) == "Werewolf" else
+                "Village" if target else None
+            ),
         )
         self._collect(event)
 
@@ -301,7 +305,8 @@ class WerewolfTextEnvV0:
             visible_to=[self.guard],
             speaker=self.guard,
             target=target or None,
-            value={"action": "GUARD", "status": "pass" if target == 0 else "protected"},
+            value=None,
+            metadata={"status": "pass" if target == 0 else "protected"},
         )
         self._collect(event)
 
@@ -309,12 +314,18 @@ class WerewolfTextEnvV0:
         if self.witch is not None and self.witch in self.alive:
             self.phase = "skill_witch"
             self.current_player = self.witch
+            availability = {
+                (True, True): "HEAL_AND_POISON_AVAILABLE",
+                (True, False): "HEAL_AVAILABLE",
+                (False, True): "POISON_AVAILABLE",
+                (False, False): "NO_POTIONS_AVAILABLE",
+            }[(not self.witch_heal_used, not self.witch_poison_used)]
             event = self._emit(
                 witch_state_event,
                 visible_to=[self.witch],
                 target=self.night_kill,
-                value={
-                    "kill_target": self.night_kill,
+                value=availability,
+                metadata={
                     "heal_available": not self.witch_heal_used,
                     "poison_available": not self.witch_poison_used,
                 },
@@ -337,7 +348,8 @@ class WerewolfTextEnvV0:
             visible_to=[self.witch],
             speaker=self.witch,
             target=target or None,
-            value={"action": action_type.upper(), "status": "pass" if target == 0 else "used"},
+            value=action_type.upper(),
+            metadata={"status": "pass" if target == 0 else "used"},
         )
 
     def _end_night(self):
@@ -357,7 +369,8 @@ class WerewolfTextEnvV0:
         event = self._emit(
             death_event,
             target=sorted(dead),
-            value={"players": sorted(dead), "cause": "night"},
+            value=None,
+            metadata={"cause": "night"},
         )
         self._collect(event)
         reward, done, info = self._is_done()
@@ -389,7 +402,7 @@ class WerewolfTextEnvV0:
             turn=self.event_counter,
             speaker=self.current_player,
             target=self.current_player,
-            value=utterance,
+            value=None,
             source_span=utterance,
         )
         self.events.append(raw_event)
@@ -434,11 +447,14 @@ class WerewolfTextEnvV0:
             vote_event,
             speaker=self.current_player,
             target=target or None,
-            value={"action": "VOTE", "target": target or None, "round": self.phase},
+            value=None,
+            metadata={"round": self.phase},
         )
         self._collect(event)
         if self.vote_queue:
             self.current_player = self.vote_queue.pop(0)
+            return False
+        return True
 
     def _end_vote(self):
         counts = Counter(target for target in self.current_votes.values() if target is not None)
@@ -449,7 +465,11 @@ class WerewolfTextEnvV0:
         result_event = self._emit(
             vote_result_event,
             target=leaders,
-            value={"counts": dict(counts), "leaders": leaders, "round": self.phase},
+            value=None,
+            metadata={
+                "counts": {str(target): count for target, count in counts.items()},
+                "round": self.phase,
+            },
         )
         self._collect(result_event)
         if self.phase == "vote" and len(leaders) > 1:
@@ -465,13 +485,13 @@ class WerewolfTextEnvV0:
             exile = self._emit(
                 exile_event,
                 target=expelled,
-                value={"player": expelled},
+                value=None,
             )
             self._collect(exile)
             reveal = self._emit(
                 role_reveal_event,
                 target=expelled,
-                value={"role": self._role(expelled)},
+                value=self._role(expelled),
             )
             self._collect(reveal)
         reward, done, info = self._is_done()
@@ -506,7 +526,7 @@ class WerewolfTextEnvV0:
         self.current_player = None
         self._emit(
             outcome_event,
-            value={"winner": "Werewolf" if info["Werewolf"] == 1 else "Village"},
+            value="Werewolf" if info["Werewolf"] == 1 else "Village",
         )
         if self.log_save_path:
             path = Path(self.log_save_path)

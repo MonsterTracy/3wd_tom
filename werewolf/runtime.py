@@ -7,8 +7,9 @@ from werewolf.agents import agent_registry
 from werewolf.backends import load_named_backends, resolve_backend
 from werewolf.envs.werewolf_text_env_v0 import WerewolfTextEnvV0
 from werewolf.events.speech_parser import SpeechEventParser
-from werewolf.runtime_config import validate_runtime_config
+from werewolf.runtime_config import resolve_guess_config, validate_runtime_config
 from werewolf.tom.collection import JsonlSink, ToMCollector
+from werewolf.tom.guess_provider import BeliefGuessProvider
 
 
 def shuffled_roles(environment_config, seed):
@@ -60,10 +61,24 @@ def build_collection_runtime(config, *, game_id, roles, backends=None):
         resolve_backend(parser_config["backend"], backends),
         parser_config["model"],
     )
+
+    def guess_provider_for(player_id):
+        profile_name = (
+            config["agents"]["werewolf_profile"]
+            if roles[player_id - 1] == "Werewolf"
+            else config["agents"]["village_profile"]
+        )
+        resolved = resolve_guess_config(
+            config, config["agents"]["profiles"][profile_name]
+        )
+        return BeliefGuessProvider(
+            resolve_backend(resolved["backend"], backends), resolved["model"]
+        )
+
     collector = ToMCollector(
         game_id=game_id,
         roles=roles,
-        guess_provider_for=lambda player_id: agents[player_id - 1].make_guess_provider(),
+        guess_provider_for=guess_provider_for,
         sample_sink=JsonlSink(config["output"]["samples"]),
         failure_sink=JsonlSink(config["output"]["failures"]),
     )

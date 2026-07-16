@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass
 
-from werewolf.events.schema import make_event
+from werewolf.events.schema import make_event, normalize_content
 
 
 SPEECH_FAMILIES = (
@@ -29,15 +29,21 @@ PARSED_EVENT_FIELDS = {
 }
 
 SYSTEM_PROMPT = """Extract only explicit, local meanings from one Werewolf utterance.
-Return exactly {\"events\":[...]} as JSON. Each event must contain exactly:
+Return exactly {\"events\":[...]} as JSON. Each event contains exactly:
 event_family, target, content, qualifier, ref_event_id, source_span,
-parser_confidence. event_family is one of BELIEF_ASSERTION, SOCIAL_STANCE,
-ACTION_POSITION, CLAIM_RESPONSE. target is a list of player ids. content has
-only kind and value. qualifier may contain only polarity, certainty, stance,
-strength, commitment, evidence_source, relation. source_span is an exact quote
-from the utterance. For the four families, kind is respectively ROLE/CAMP/FACT,
-STANCE, ACTION, or RELATION. Use [] when nothing explicit is extractable.
-Never infer hidden intent or behavior-level diagnoses."""
+parser_confidence. target is player ids and source_span is an exact quote.
+Allowed family/kind/value rules are:
+- BELIEF_ASSERTION/ROLE: Werewolf, Seer, Witch, Guard, or Villager.
+- BELIEF_ASSERTION/CAMP: Werewolf or Village.
+- BELIEF_ASSERTION/FACT: null.
+- SOCIAL_STANCE/STANCE: null; put polarity and strength in qualifier.
+- ACTION_POSITION/ACTION: VOTE or PASS; put commitment in qualifier.
+- CLAIM_RESPONSE/RELATION: null; put support, challenge, question, or retract
+  in qualifier.relation.
+qualifier may contain only polarity, certainty, stance, strength, commitment,
+evidence_source, relation. Never copy free text into content.value. If a claim
+cannot be represented exactly by these values, omit it. Use [] when nothing
+explicit is extractable. Never infer hidden intent or higher-order diagnoses."""
 
 
 @dataclass(frozen=True)
@@ -80,6 +86,9 @@ def _parse_payload(
             raise ValueError("parsed content must contain only kind and value")
         if content["kind"] not in SPEECH_KINDS[item["event_family"]]:
             raise ValueError("content.kind is not valid for its speech family")
+        normalized_content = normalize_content(content)
+        if normalized_content != content:
+            raise ValueError("speech parser content.value must already be canonical")
         source_span = item["source_span"]
         if not isinstance(source_span, str) or not source_span:
             raise ValueError("source_span must be a non-empty exact quote")

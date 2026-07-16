@@ -7,8 +7,8 @@ ALL_PLAYERS = list(range(1, 8))
 
 
 def game_event(
-    *, event_id, day, phase, turn, kind, value, target=None, speaker=0,
-    utterance_id=None, source_span=None, qualifier=None,
+    *, event_id, day, phase, turn, kind, value=None, target=None, speaker=0,
+    utterance_id=None, source_span=None, qualifier=None, metadata=None,
 ):
     return make_event(
         event_id=event_id,
@@ -23,14 +23,15 @@ def game_event(
         event_family="GAME_EVENT",
         target=target,
         content={"kind": kind, "value": value},
+        metadata=metadata,
         qualifier=qualifier,
         source_span=source_span,
     )
 
 
 def private_fact(
-    *, event_id, day, phase, turn, visible_to, kind, value, target=None,
-    speaker=0,
+    *, event_id, day, phase, turn, visible_to, kind, value=None, target=None,
+    speaker=0, metadata=None,
 ):
     return make_event(
         event_id=event_id,
@@ -44,6 +45,7 @@ def private_fact(
         event_family="PRIVATE_FACT",
         target=target,
         content={"kind": kind, "value": value},
+        metadata=metadata,
         qualifier={"certainty": "strong", "evidence_source": "private_fact"},
     )
 

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import shutil
 from copy import deepcopy
 from pathlib import Path
@@ -10,17 +11,94 @@ import yaml
 
 from werewolf.backends import load_named_backends
 from werewolf.runtime import build_collection_runtime, rollout, shuffled_roles
-from werewolf.runtime_config import validate_runtime_config
+from werewolf.runtime_config import resolve_guess_config, validate_runtime_config
+from werewolf.tom.collection import assert_audit_passes, build_audit_report
 
 
-def collect_from_config(config, *, games=None, backends=None):
+def _writable_ancestor(path):
+    candidate = Path(path).resolve()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def preflight_collection(config, *, env=None):
+    """Validate a production collection run without constructing network clients."""
+
     validate_runtime_config(config)
+    env = os.environ if env is None else env
+    profiles = config["agents"]["profiles"]
+    assigned_profiles = {
+        config["agents"]["werewolf_profile"],
+        config["agents"]["village_profile"],
+    }
+    used_backends = {config["parser"]["backend"]}
+    resolved_guesses = {}
+    for profile_name in assigned_profiles:
+        profile = profiles[profile_name]
+        used_backends.add(profile["backend"])
+        resolved_guess = resolve_guess_config(config, profile)
+        resolved_guesses[profile_name] = resolved_guess
+        used_backends.add(resolved_guess["backend"])
+    for backend_name in used_backends:
+        backend = config["backends"][backend_name]
+        if backend["type"] != "openai_compatible":
+            raise ValueError("production collection cannot use a mock backend")
+        if not backend["base_url"].strip():
+            raise ValueError(f"backend {backend_name}.base_url is required")
+        key_name = backend["api_key_env"]
+        if not isinstance(env.get(key_name), str) or not env[key_name].strip():
+            raise ValueError(f"API key environment variable {key_name} is required")
+    for output_name in ("samples", "failures", "logs"):
+        ancestor = _writable_ancestor(config["output"][output_name])
+        if not os.access(ancestor, os.W_OK):
+            raise ValueError(
+                f"output.{output_name} is not writable via {ancestor}"
+            )
+    return {
+        "backend_names": sorted(used_backends),
+        "parser": dict(config["parser"]),
+        "gameplay": {
+            name: {
+                "backend": profiles[name]["backend"],
+                "model": profiles[name]["model"],
+            }
+            for name in sorted(assigned_profiles)
+        },
+        "guess": {name: resolved_guesses[name] for name in sorted(resolved_guesses)},
+    }
+
+
+def _read_jsonl(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    records = []
+    with path.open("r", encoding="utf-8") as source:
+        for line in source:
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                records.append(None)
+    return records
+
+
+def collect_from_config(config, *, games=None, backends=None, env=None):
     config = deepcopy(config)
     if games is not None:
         if games < 1:
             raise ValueError("games must be positive")
         config["games"] = games
-    output_paths = [Path(config["output"][name]) for name in ("samples", "failures")]
+    preflight = preflight_collection(config, env=env)
+    samples_path = Path(config["output"]["samples"])
+    audit_path = samples_path.with_suffix(".audit.json")
+    output_paths = [
+        samples_path,
+        Path(config["output"]["failures"]),
+        audit_path,
+    ]
     for path in output_paths:
         if path.exists() and not config["output"]["overwrite"]:
             raise FileExistsError(f"refusing to append to existing output: {path}")
@@ -53,7 +131,25 @@ def collect_from_config(config, *, games=None, backends=None):
             max_steps=game_config["max_steps"],
         )
         results.append({"game_id": game_id, "roles": roles, **result})
-    return results
+    samples = _read_jsonl(samples_path)
+    failures = _read_jsonl(config["output"]["failures"])
+    audit = build_audit_report(
+        samples,
+        failures,
+        game_ids=[result["game_id"] for result in results],
+    )
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(
+        json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert_audit_passes(audit)
+    return {
+        "games": results,
+        "preflight": preflight,
+        "audit_path": str(audit_path),
+        "audit": audit,
+    }
 
 
 def main():
@@ -63,7 +159,26 @@ def main():
     args = parser.parse_args()
     with Path(args.config).open("r", encoding="utf-8") as source:
         config = yaml.safe_load(source)
-    print(json.dumps(collect_from_config(config, games=args.games), ensure_ascii=False, indent=2))
+    result = collect_from_config(config, games=args.games)
+    audit = result["audit"]
+    print(
+        json.dumps(
+            {
+                "games": len(result["games"]),
+                "audit_path": result["audit_path"],
+                "unique_belief_elicitations": audit["unique_belief_elicitations"],
+                "successful_guesses": audit["successful_guesses"],
+                "failed_guesses": audit["failed_guesses"],
+                "training_samples": (
+                    audit["first_order_samples"]
+                    + audit["second_order_public_samples"]
+                    + audit["second_order_wolf_samples"]
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

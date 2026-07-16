@@ -75,20 +75,18 @@ def knowledge_for_player(events, player_id: int) -> dict:
             and kind == "CHECK_RESULT"
             and event["target"]
         ):
-            camp = value.get("camp") if isinstance(value, dict) else value
-            if camp == "Werewolf":
+            if value == "Werewolf":
                 known_wolves.add(event["target"][0])
-            elif camp == "Village":
+            elif value == "Village":
                 known_good.add(event["target"][0])
         elif (
             event["event_family"] == "GAME_EVENT"
             and kind == "ROLE_REVEAL"
             and event["target"]
         ):
-            revealed_role = value.get("role") if isinstance(value, dict) else value
-            if revealed_role == "Werewolf":
+            if value == "Werewolf":
                 known_wolves.add(event["target"][0])
-            elif revealed_role in ("Seer", "Witch", "Guard", "Villager"):
+            elif value in ("Seer", "Witch", "Guard", "Villager"):
                 known_good.add(event["target"][0])
     return {
         "role": role,

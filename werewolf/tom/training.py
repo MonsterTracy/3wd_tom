@@ -8,11 +8,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import collate_features
 from werewolf.tom.losses import masked_pair_cross_entropy
 from werewolf.tom.metrics import compute_metrics
 from werewolf.tom.model import ToMModel, ToMModelConfig
+from werewolf.tom.pair_space import WOLF_PAIRS
 
 
 TRAIN_SCHEMA_VERSION = "train.v1"
@@ -167,6 +169,12 @@ def train_from_config(config):
         history.append(epoch_record)
         checkpoint = {
             "schema_version": "model.v1",
+            "pair_space": [list(pair) for pair in WOLF_PAIRS],
+            "event_encoder": {
+                "schema_version": ENCODER_SCHEMA_VERSION,
+                "kind_vocabulary": dict(KIND2ID),
+                "value_vocabulary": dict(VALUE2ID),
+            },
             "epoch": epoch,
             "config": config,
             "model_state": model.state_dict(),

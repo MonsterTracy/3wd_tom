@@ -4,7 +4,7 @@ import torch
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import collate_features
 from werewolf.tom.losses import masked_pair_cross_entropy
-from werewolf.tom.metrics import compute_metrics, player_marginals
+from werewolf.tom.metrics import compute_metrics, pair_probabilities, player_marginals
 from werewolf.tom.model import ToMModel, ToMModelConfig
 
 
@@ -40,3 +40,14 @@ def test_loss_rejects_a_label_masked_by_knowledge():
     mask[:, 0] = True
     with pytest.raises(ValueError, match="excluded"):
         masked_pair_cross_entropy(logits, labels, mask)
+
+
+def test_torch_masked_probabilities_are_normalized_and_exactly_zero_when_invalid():
+    logits = torch.linspace(-2, 2, 42).reshape(2, 21)
+    mask = torch.zeros(2, 21, dtype=torch.bool)
+    mask[0, [0, 5]] = True
+    mask[1, [3, 8, 20]] = True
+    probabilities = pair_probabilities(logits, mask)
+    assert torch.all(probabilities >= 0)
+    assert torch.allclose(probabilities.sum(1), torch.ones(2))
+    assert torch.equal(probabilities[~mask], torch.zeros_like(probabilities[~mask]))

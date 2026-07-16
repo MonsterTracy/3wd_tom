@@ -1,9 +1,17 @@
 """Checkpoint-driven collection for first- and second-order ToM labels."""
 
 import json
+import math
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from werewolf.events.encoder import (
+    EVENT_TOKEN_FIELDS,
+    KIND2ID,
+    VALUE2ID,
+    encode_event,
+)
 from werewolf.events.streams import (
     knowledge_for_player,
     public_events,
@@ -11,7 +19,13 @@ from werewolf.events.streams import (
     visible_events,
 )
 from werewolf.tom.masks import first_order_knowledge_mask, second_order_output_mask
-from werewolf.tom.schemas import FIRST_ORDER_MODE, make_sample
+from werewolf.tom.schemas import (
+    FIRST_ORDER_MODE,
+    first_order_key,
+    make_sample,
+    second_order_key,
+    validate_sample,
+)
 
 
 PUBLIC_CHECKPOINTS = {
@@ -40,10 +54,308 @@ class JsonlSink:
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
 
     def append(self, record):
         with self.path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _distribution(counter):
+    return {str(key): counter[key] for key in sorted(counter, key=str)}
+
+
+def _percentile(values, percentile):
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile * len(ordered)) - 1)
+    return ordered[index]
+
+
+def _safe_unknown_raw_value(value):
+    if isinstance(value, dict):
+        value = {
+            str(key): (
+                "<redacted>"
+                if any(
+                    marker in str(key).lower()
+                    for marker in ("api_key", "token", "secret", "password")
+                )
+                else item
+            )
+            for key, item in list(value.items())[:20]
+        }
+    rendered = repr(value)
+    if rendered.startswith(("'sk-", '"sk-')):
+        return "'<redacted>'"
+    return rendered[:160]
+
+
+def build_audit_report(
+    samples,
+    failures=(),
+    *,
+    game_ids=(),
+    max_sequence_length=512,
+):
+    """Build deterministic collection statistics without changing any records."""
+
+    successful = list(samples)
+    records = successful + list(failures)
+    sample_id_counts = Counter()
+    first_key_counts = Counter()
+    second_key_counts = Counter()
+    schema_errors = 0
+    labels_outside_mask = 0
+    public_checkpoints = set()
+    private_checkpoints = set()
+    games = {str(game_id) for game_id in game_ids}
+    first_by_id = {}
+    first_records = []
+    second_records = []
+
+    for record in records:
+        if not isinstance(record, dict):
+            schema_errors += 1
+            continue
+        if record.get("game_id") is not None:
+            games.add(str(record["game_id"]))
+        sample_id = record.get("sample_id")
+        if sample_id is not None:
+            sample_id_counts[sample_id] += 1
+        try:
+            validate_sample(record, require_success=False)
+        except (TypeError, ValueError, KeyError):
+            schema_errors += 1
+        label_index = record.get("label_index")
+        mask = record.get("output_mask")
+        if label_index is not None and (
+            type(label_index) is not int
+            or not isinstance(mask, list)
+            or not 0 <= label_index < len(mask)
+            or not mask[label_index]
+        ):
+            labels_outside_mask += 1
+        scope = record.get("checkpoint_scope")
+        checkpoint_key = (record.get("game_id"), record.get("state_id"))
+        if scope == "public":
+            public_checkpoints.add(checkpoint_key)
+        elif scope == "private":
+            private_checkpoints.add(checkpoint_key)
+        try:
+            if record.get("task") == "first_order":
+                key = first_order_key(record)
+                first_key_counts[key] += 1
+                first_records.append(record)
+                first_by_id.setdefault(record["sample_id"], record)
+            elif record.get("task") == "second_order":
+                key = second_order_key(record)
+                second_key_counts[key] += 1
+                second_records.append(record)
+        except (KeyError, TypeError):
+            pass
+
+    state_alignment_errors = 0
+    private_to_second_order_errors = 0
+    for second in second_records:
+        source = first_by_id.get(second.get("source_first_order_sample_id"))
+        if second.get("checkpoint_scope") != "public":
+            private_to_second_order_errors += 1
+        if source is None:
+            state_alignment_errors += 1
+            continue
+        if source.get("checkpoint_scope") != "public":
+            private_to_second_order_errors += 1
+        aligned = (
+            second.get("game_id") == source.get("game_id")
+            and second.get("public_state_id") == source.get("public_state_id")
+            and second.get("target_id") == source.get("observer_id")
+            and second.get("label_pair") == source.get("label_pair")
+            and second.get("label_index") == source.get("label_index")
+        )
+        if not aligned:
+            state_alignment_errors += 1
+
+    unique_first = {}
+    for record in first_records:
+        try:
+            unique_first.setdefault(first_order_key(record), record)
+        except KeyError:
+            continue
+    successful_guesses = sum(
+        record.get("guess", {}).get("status") == "ok"
+        for record in unique_first.values()
+    )
+    failed_guesses = sum(
+        record.get("guess", {}).get("status") == "failed"
+        for record in unique_first.values()
+    )
+    repair_attempts = sum(
+        max(0, record.get("guess", {}).get("attempts", 1) - 1)
+        for record in unique_first.values()
+    )
+
+    mask_sizes = Counter()
+    pair_labels = Counter()
+    event_families = Counter()
+    samples_by_day = Counter()
+    samples_by_phase = Counter()
+    first_by_role = Counter()
+    sequence_lengths = []
+    unknown_kind_count = 0
+    unknown_value_count = 0
+    not_applicable_value_count = 0
+    semantic_token_count = 0
+    unknown_by_event_family = Counter()
+    unknown_by_content_kind = Counter()
+    unknown_raw_values = Counter()
+    kind_index = EVENT_TOKEN_FIELDS.index("kind_id")
+    value_index = EVENT_TOKEN_FIELDS.index("value_id")
+    for sample in successful:
+        mask = sample.get("output_mask", [])
+        if isinstance(mask, list):
+            mask_sizes[sum(value is True for value in mask)] += 1
+        label_pair = sample.get("label_pair")
+        if isinstance(label_pair, list) and len(label_pair) == 2:
+            pair_labels[f"{label_pair[0]}-{label_pair[1]}"] += 1
+        samples_by_day[sample.get("day")] += 1
+        samples_by_phase[sample.get("phase")] += 1
+        events = sample.get("events", [])
+        if not isinstance(events, list):
+            events = []
+        event_families.update(
+            event.get("event_family")
+            for event in events
+            if isinstance(event, dict) and event.get("event_family") is not None
+        )
+        tokens = []
+        for event in events:
+            try:
+                event_tokens = encode_event(event)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            tokens.extend(event_tokens)
+        sequence_lengths.append(len(tokens))
+        if sample.get("task") == "first_order":
+            try:
+                role = knowledge_for_player(events, sample["observer_id"])["role"]
+            except (KeyError, TypeError, ValueError):
+                role = "unknown"
+            first_by_role[role or "unknown"] += 1
+
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(
+            record.get("events"), list
+        ):
+            continue
+        for event in record["events"]:
+            try:
+                event_tokens = encode_event(event)
+                family = event.get("event_family", "<missing>")
+                content = event.get("content", {})
+                content_kind = content.get("kind", "<missing>")
+                raw_value = content.get("value")
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            for token in event_tokens:
+                semantic_token_count += 1
+                if token[kind_index] == KIND2ID["UNKNOWN"]:
+                    unknown_kind_count += 1
+                    unknown_by_event_family[family] += 1
+                    unknown_by_content_kind[content_kind] += 1
+                    continue
+                if token[value_index] == VALUE2ID["NONE"]:
+                    not_applicable_value_count += 1
+                    continue
+                semantic_token_count += 1
+                if token[value_index] == VALUE2ID["UNKNOWN"]:
+                    unknown_value_count += 1
+                    unknown_by_event_family[family] += 1
+                    unknown_by_content_kind[content_kind] += 1
+                    unknown_raw_values[_safe_unknown_raw_value(raw_value)] += 1
+
+    sequence_length = {
+        "min": min(sequence_lengths, default=0),
+        "p50": _percentile(sequence_lengths, 0.50),
+        "p90": _percentile(sequence_lengths, 0.90),
+        "p95": _percentile(sequence_lengths, 0.95),
+        "p99": _percentile(sequence_lengths, 0.99),
+        "max": max(sequence_lengths, default=0),
+    }
+    return {
+        "schema_version": "tom.audit.v1_1",
+        "games": len(games),
+        "public_checkpoints": len(public_checkpoints),
+        "private_checkpoints": len(private_checkpoints),
+        "unique_belief_elicitations": len(unique_first),
+        "successful_guesses": successful_guesses,
+        "failed_guesses": failed_guesses,
+        "repair_attempts": repair_attempts,
+        "first_order_samples": sum(
+            sample.get("task") == "first_order" for sample in successful
+        ),
+        "second_order_public_samples": sum(
+            sample.get("task") == "second_order" and sample.get("mode") == "public_only"
+            for sample in successful
+        ),
+        "second_order_wolf_samples": sum(
+            sample.get("task") == "second_order" and sample.get("mode") == "wolf_conditioned"
+            for sample in successful
+        ),
+        "duplicate_sample_ids": sum(count - 1 for count in sample_id_counts.values() if count > 1),
+        "duplicate_first_order_keys": sum(count - 1 for count in first_key_counts.values() if count > 1),
+        "duplicate_second_order_keys": sum(count - 1 for count in second_key_counts.values() if count > 1),
+        "state_alignment_errors": state_alignment_errors,
+        "private_to_second_order_errors": private_to_second_order_errors,
+        "schema_errors": schema_errors,
+        "labels_outside_mask": labels_outside_mask,
+        "mask_size_distribution": _distribution(mask_sizes),
+        "pair_label_distribution": _distribution(pair_labels),
+        "event_family_distribution": _distribution(event_families),
+        "unknown_kind_count": unknown_kind_count,
+        "unknown_value_count": unknown_value_count,
+        "not_applicable_value_count": not_applicable_value_count,
+        "unknown_by_event_family": _distribution(unknown_by_event_family),
+        "unknown_by_content_kind": _distribution(unknown_by_content_kind),
+        "top_unknown_raw_values": [
+            {"value": value, "count": count}
+            for value, count in sorted(
+                unknown_raw_values.items(), key=lambda item: (-item[1], item[0])
+            )[:20]
+        ],
+        "unknown_token_count": unknown_kind_count + unknown_value_count,
+        "unknown_token_ratio": (
+            (unknown_kind_count + unknown_value_count) / semantic_token_count
+            if semantic_token_count
+            else 0.0
+        ),
+        "sequence_length": sequence_length,
+        "truncated_samples": sum(
+            length > max_sequence_length for length in sequence_lengths
+        ),
+        "samples_by_day": _distribution(samples_by_day),
+        "samples_by_phase": _distribution(samples_by_phase),
+        "first_order_by_observer_role": _distribution(first_by_role),
+    }
+
+
+def assert_audit_passes(report):
+    fatal_fields = (
+        "duplicate_sample_ids",
+        "duplicate_first_order_keys",
+        "duplicate_second_order_keys",
+        "state_alignment_errors",
+        "private_to_second_order_errors",
+        "schema_errors",
+        "labels_outside_mask",
+        "unknown_kind_count",
+        "unknown_value_count",
+    )
+    failures = {name: report.get(name, 0) for name in fatal_fields if report.get(name, 0)}
+    if failures:
+        raise RuntimeError(f"collection audit failed: {failures}")
+    return True
 
 
 def checkpoint_for_event(event):
@@ -77,6 +389,9 @@ class ToMCollector:
         self.guess_provider_for = guess_provider_for
         self.sample_sink = sample_sink
         self.failure_sink = failure_sink
+        self._sample_ids = set()
+        self._first_order_keys = set()
+        self._second_order_keys = set()
 
     def collect(self, *, trigger_event, events, alive_players):
         checkpoint = checkpoint_for_event(trigger_event)
@@ -115,10 +430,13 @@ class ToMCollector:
 
     def _base(self, trigger_event, checkpoint):
         state_id = f"{self.game_id}:{trigger_event['event_id']}"
+        checkpoint_scope = trigger_event["visibility"]
         return {
             "game_id": self.game_id,
             "checkpoint": checkpoint,
+            "checkpoint_scope": checkpoint_scope,
             "state_id": state_id,
+            "public_state_id": state_id if checkpoint_scope == "public" else None,
             "day": trigger_event["day"],
             "phase": trigger_event["phase"],
             "turn": trigger_event["turn"],
@@ -132,10 +450,27 @@ class ToMCollector:
             **base,
             **kwargs,
         )
+        self._register(sample)
         sink = self.sample_sink if guess.status == "ok" else self.failure_sink
         if sink is not None:
             sink.append(sample)
         return sample
+
+    def _register(self, sample):
+        sample_id = sample["sample_id"]
+        if sample_id in self._sample_ids:
+            raise ValueError(f"duplicate sample_id: {sample_id}")
+        self._sample_ids.add(sample_id)
+        if sample["task"] == "first_order":
+            key = first_order_key(sample)
+            if key in self._first_order_keys:
+                raise ValueError(f"duplicate first-order key: {key}")
+            self._first_order_keys.add(key)
+            return
+        key = second_order_key(sample)
+        if key in self._second_order_keys:
+            raise ValueError(f"duplicate second-order key: {key}")
+        self._second_order_keys.add(key)
 
     def _collect_public(self, *, trigger_event, checkpoint, events, alive_players):
         alive = set(alive_players)
@@ -153,20 +488,21 @@ class ToMCollector:
         failures = []
         for target_id in nonwolf_targets:
             guess, first_mask = self._target_guess(target_id, events)
+            first_sample = self._sample(
+                suffix=f"first:{target_id}",
+                trigger_event=trigger_event,
+                checkpoint=checkpoint,
+                guess=guess,
+                task="first_order",
+                mode=FIRST_ORDER_MODE,
+                observer_id=target_id,
+                modeler_id=None,
+                target_id=None,
+                events=visible_events(events, target_id),
+                output_mask=first_mask,
+            )
             target_records = [
-                self._sample(
-                    suffix=f"first:{target_id}",
-                    trigger_event=trigger_event,
-                    checkpoint=checkpoint,
-                    guess=guess,
-                    task="first_order",
-                    mode=FIRST_ORDER_MODE,
-                    observer_id=target_id,
-                    modeler_id=None,
-                    target_id=None,
-                    events=visible_events(events, target_id),
-                    output_mask=first_mask,
-                ),
+                first_sample,
                 self._sample(
                     suffix=f"second:public:{target_id}",
                     trigger_event=trigger_event,
@@ -177,6 +513,7 @@ class ToMCollector:
                     observer_id=None,
                     modeler_id=None,
                     target_id=target_id,
+                    source_first_order_sample_id=first_sample["sample_id"],
                     events=public_events(events),
                     output_mask=second_order_output_mask(
                         mode="public_only", target_id=target_id
@@ -195,6 +532,7 @@ class ToMCollector:
                         observer_id=None,
                         modeler_id=modeler_id,
                         target_id=target_id,
+                        source_first_order_sample_id=first_sample["sample_id"],
                         events=visible_events(events, modeler_id),
                         output_mask=second_order_output_mask(
                             mode="wolf_conditioned", target_id=target_id

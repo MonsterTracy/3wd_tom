@@ -13,6 +13,7 @@ TOP_LEVEL_FIELDS = {
     "max_steps",
     "backends",
     "parser",
+    "guess",
     "agents",
     "environment",
     "output",
@@ -57,14 +58,22 @@ def validate_runtime_config(config):
             raise ValueError("only openai_compatible backends are supported")
         _text(backend["api_key_env"], f"backend {name}.api_key_env")
         _text(backend["default_model"], f"backend {name}.default_model")
-        if backend["base_url"] is not None and not isinstance(backend["base_url"], str):
-            raise ValueError(f"backend {name}.base_url must be text or null")
+        _text(backend["base_url"], f"backend {name}.base_url")
 
     parser = config["parser"]
     _exact_fields(parser, {"backend", "model"}, "parser")
     if parser["backend"] not in backends:
         raise ValueError("parser backend does not exist")
     _text(parser["model"], "parser.model")
+
+    guess = config["guess"]
+    _exact_fields(guess, {"backend", "model"}, "guess")
+    if (guess["backend"] is None) != (guess["model"] is None):
+        raise ValueError("guess.backend and guess.model must both inherit or both be set")
+    if guess["backend"] is not None:
+        if guess["backend"] not in backends:
+            raise ValueError("guess backend does not exist")
+        _text(guess["model"], "guess.model")
 
     agents = config["agents"]
     _exact_fields(agents, {"profiles", "werewolf_profile", "village_profile"}, "agents")
@@ -118,3 +127,12 @@ def validate_runtime_config(config):
 def normalize_runtime_config(config):
     validate_runtime_config(config)
     return deepcopy(config)
+
+
+def resolve_guess_config(config, profile):
+    """Resolve the optional global guess override against a gameplay profile."""
+
+    guess = config["guess"]
+    if guess["backend"] is None:
+        return {"backend": profile["backend"], "model": profile["model"]}
+    return deepcopy(guess)
