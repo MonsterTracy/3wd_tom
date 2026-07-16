@@ -1,0 +1,7 @@
+schema_version: evaluate.v1
+checkpoint: artifacts/tom/first_order/best.pt
+data_paths: [data/tom/test.jsonl]
+batch_size: 128
+device: auto
+include_first_order_private: true
+output: artifacts/tom/first_order/evaluation.json

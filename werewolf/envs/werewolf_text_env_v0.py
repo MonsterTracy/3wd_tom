@@ -1,586 +1,565 @@
-import random
-from copy import deepcopy
-import json, os
-import numpy as np
-import gym
-from collections import Counter
+"""Seven-player text Werewolf environment backed by unified structured events."""
+
 import json
+import random
+from collections import Counter
+from pathlib import Path
 
-from werewolf.helper.log_utils import Log
-from werewolf.models import SpeechPerceiver
+from werewolf.events.environment_events import (
+    check_result_event,
+    death_event,
+    exile_event,
+    guard_result_event,
+    outcome_event,
+    private_action_event,
+    role_reveal_event,
+    self_role_event,
+    setting_event,
+    speech_event,
+    vote_event,
+    vote_result_event,
+    witch_state_event,
+    wolf_team_event,
+)
+from werewolf.events.streams import visible_events
 
 
-class WerewolfTextEnvV0(gym.Env):
+SUPPORTED_ROLES = {"Werewolf", "Seer", "Witch", "Guard", "Villager"}
+
+
+class WerewolfTextEnvV0:
+    """Fixed 2-wolf/1-seer/3-villager/1-witch-or-guard game."""
+
     def __init__(self, **kwargs):
-        self.n_player = kwargs.get('n_player', 7)
-        self.n_role = kwargs.get('n_role', 4)
-        self.n_werewolf = kwargs.get('n_werewolf', 2)
-        self.n_seer = kwargs.get('n_seer', 1)
-        self.n_guard = kwargs.get('n_guard', 0)
-        self.n_witch = kwargs.get('n_witch', 1)
-        self.n_hunter = kwargs.get('n_hunter', 0)
-        self.n_villager = kwargs.get('n_villager', 3)
+        self.n_player = kwargs.get("n_player", 7)
+        self.n_role = kwargs.get("n_role", 4)
+        self.n_werewolf = kwargs.get("n_werewolf", 2)
+        self.n_seer = kwargs.get("n_seer", 1)
+        self.n_guard = kwargs.get("n_guard", 0)
+        self.n_witch = kwargs.get("n_witch", 1)
+        self.n_hunter = kwargs.get("n_hunter", 0)
+        self.n_villager = kwargs.get("n_villager", 3)
         self._validate_7p_config()
-        self.roles = (["Werewolf" for _ in range(self.n_werewolf)] + ["Seer" for _ in range(self.n_seer)] +
-                      ["Guard" for _ in range(self.n_guard)] + ["Witch" for _ in range(self.n_witch)] +
-                      ["Villager" for _ in range(self.n_villager)])
-        self.game_phase_set = ['init', 'skill_wolf', 'skill_seer', 'skill_guard', 'skill_witch',
-                               'speech', 'speech_pk', 'vote', 'vote_pk', 'end_game']
-
+        self.base_roles = (
+            ["Werewolf"] * self.n_werewolf
+            + ["Seer"] * self.n_seer
+            + ["Guard"] * self.n_guard
+            + ["Witch"] * self.n_witch
+            + ["Villager"] * self.n_villager
+        )
+        self.roles = list(self.base_roles)
+        self.werewolf_reward = kwargs.get("werewolf_reward", 1)
+        self.village_reward = kwargs.get("village_reward", 1)
+        self.log_save_path = kwargs.get("log_save_path")
+        self.speech_parser = kwargs.get("speech_parser")
+        self.tom_collector = kwargs.get("tom_collector")
+        self.rng = random.Random(kwargs.get("random_seed"))
         self.game_count = 0
         self.wolf_win_count = 0
-
-        self.werewolf_reward = kwargs.get('werewolf_reward', 1)
-        self.village_reward = kwargs.get('village_reward', 1)
-        self.game_log = []
-
-        self.log_save_path = kwargs.get('log_save_path', os.path.join(os.getcwd(), 'tmp_logs'))
-        speech_perceiver = kwargs.get('speech_perceiver')
-        self.speech_perceiver = (
-            speech_perceiver if speech_perceiver is not None else SpeechPerceiver()
-        )
+        self.collection_batches = []
+        self.parser_failures = []
 
     def _validate_7p_config(self):
-        expected_counts = {
-            'n_player': 7,
-            'n_role': 4,
-            'n_werewolf': 2,
-            'n_seer': 1,
-            'n_villager': 3,
-            'n_hunter': 0,
+        fixed = {
+            "n_player": 7,
+            "n_role": 4,
+            "n_werewolf": 2,
+            "n_seer": 1,
+            "n_villager": 3,
+            "n_hunter": 0,
         }
-        for attribute, expected in expected_counts.items():
-            actual = getattr(self, attribute)
+        for name, expected in fixed.items():
+            actual = getattr(self, name)
             if actual != expected:
-                raise ValueError(
-                    f"{attribute} must be {expected} for a 7-player game, got {actual}."
-                )
-
+                raise ValueError(f"{name} must be {expected}, got {actual}")
         if self.n_guard not in (0, 1) or self.n_witch not in (0, 1):
-            raise ValueError("n_guard and n_witch must each be 0 or 1.")
+            raise ValueError("n_guard and n_witch must each be zero or one")
         if self.n_guard + self.n_witch != 1:
-            raise ValueError("Exactly one of n_guard and n_witch must be 1.")
+            raise ValueError("exactly one of n_guard and n_witch must be one")
 
-        role_total = (
-            self.n_werewolf + self.n_seer + self.n_guard +
-            self.n_witch + self.n_hunter + self.n_villager
+    @staticmethod
+    def _validate_roles(roles):
+        if len(roles) != 7:
+            raise ValueError("roles must contain exactly seven entries")
+        counts = Counter(roles)
+        if set(counts) - SUPPORTED_ROLES:
+            raise ValueError(f"unsupported roles: {sorted(set(counts) - SUPPORTED_ROLES)}")
+        if counts["Werewolf"] != 2 or counts["Seer"] != 1 or counts["Villager"] != 3:
+            raise ValueError("roles require two wolves, one seer, and three villagers")
+        if counts["Witch"] + counts["Guard"] != 1:
+            raise ValueError("roles require exactly one witch or guard")
+
+    def set_tom_collector(self, collector):
+        self.tom_collector = collector
+
+    def _role(self, player_id):
+        return self.roles[player_id - 1]
+
+    def _phase_label(self):
+        return f"{self.day}_{self.day_or_night}_{self.phase}"
+
+    def _next_event_id(self, prefix="e"):
+        self.event_counter += 1
+        return f"g{self.game_count}.{prefix}{self.event_counter:05d}"
+
+    def _emit(self, builder, **kwargs):
+        event = builder(
+            event_id=self._next_event_id(),
+            day=self.day,
+            phase=self._phase_label(),
+            turn=self.event_counter,
+            **kwargs,
         )
-        if role_total != self.n_player:
-            raise ValueError(
-                f"Role count must equal n_player, got {role_total} and {self.n_player}."
-            )
+        self.events.append(event)
+        return event
 
-    def _validate_roles(self):
-        if len(self.roles) != 7:
-            raise ValueError(f"roles must contain exactly 7 entries, got {len(self.roles)}.")
-
-        role_counts = Counter(self.roles)
-        supported_roles = {"Werewolf", "Seer", "Witch", "Guard", "Villager"}
-        unsupported_roles = set(role_counts) - supported_roles
-        if unsupported_roles:
-            raise ValueError(f"Unsupported roles: {sorted(unsupported_roles)}.")
-
-        required_counts = {"Werewolf": 2, "Seer": 1, "Villager": 3}
-        for role, expected in required_counts.items():
-            actual = role_counts[role]
-            if actual != expected:
-                raise ValueError(
-                    f"roles must contain {expected} {role}, got {actual}."
-                )
-
-        if role_counts["Witch"] not in (0, 1) or role_counts["Guard"] not in (0, 1):
-            raise ValueError("Witch and Guard counts must each be 0 or 1.")
-        if role_counts["Witch"] + role_counts["Guard"] != 1:
-            raise ValueError("roles must contain exactly one Witch or Guard.")
+    def _collect(self, event):
+        if self.tom_collector is None:
+            return
+        batch = self.tom_collector.collect(
+            trigger_event=event,
+            events=self.events,
+            alive_players=sorted(self.alive),
+        )
+        self.collection_batches.append(batch)
 
     def reset(self, **kwargs):
         self.game_count += 1
-        if 'roles' in kwargs:
-            self.roles = list(kwargs['roles'])
-        else:
-            random.shuffle(self.roles)
-        self._validate_roles()
-
-        self.WOLF_IDX = [idx for idx, role in enumerate(self.roles) if role == 'Werewolf']
-        self.SEER_IDX = self.roles.index('Seer')
-        self.GUARD_IDX = self.roles.index('Guard') if 'Guard' in self.roles else -1
-        self.WITCH_IDX = self.roles.index('Witch') if 'Witch' in self.roles else -1
-        self.VILLAGER_IDX = [idx for idx, role in enumerate(self.roles) if role == 'Villager']
-
+        roles = list(kwargs["roles"]) if "roles" in kwargs else list(self.base_roles)
+        if "roles" not in kwargs:
+            self.rng.shuffle(roles)
+        self._validate_roles(roles)
+        self.roles = roles
+        self.wolves = [player_id for player_id in range(1, 8) if self._role(player_id) == "Werewolf"]
+        self.seer = self.roles.index("Seer") + 1
+        self.guard = self.roles.index("Guard") + 1 if "Guard" in self.roles else None
+        self.witch = self.roles.index("Witch") + 1 if "Witch" in self.roles else None
+        self.alive = set(range(1, 8))
+        self.day = 0
+        self.day_or_night = "night"
+        self.phase = "init"
+        self.current_player = None
+        self.event_counter = 0
+        self.events = []
+        self.parser_failures = []
+        self.collection_batches = []
         self.speech_queue = []
         self.vote_queue = []
-        self.day = 0
-        self.day_or_night = 'day'
-        self.alive = [1 for _ in range(self.n_player)]
-
-        self.single_werewolf_kill_target = [{} for _ in range(len(self.WOLF_IDX))]
-        self.werewolf_kill_decision = {}
-        self.seer_check_target = {}
-        self.guard_target = {}
-        self.witch_heal_target = {}
-        self.witch_poison_target = {}
-        self.vote_target = [{} for _ in range(self.n_player)]
-        self.game_log = []
         self.vote_pk_players = []
+        self.night_wolf_choices = []
+        self.night_kill = None
+        self.seer_checked = set()
+        self.guard_history = []
+        self.guard_target = None
+        self.witch_heal_used = False
+        self.witch_poison_used = False
+        self.witch_heal_target = None
+        self.witch_poison_target = None
+        self.current_votes = {}
 
-
-        self.phase = 'init'
-        self.game_log.append(Log(viewer=[i for i in range(self.n_player)], source=-1, target=-1,
-                                 content=Counter(self.roles), day=self.day,
-                                 time=self.get_time(), event='game_setting'))
-        self.game_log.append(Log(viewer=[-1,], source=-1, target=-1,
-                                 content={idx+1: self.roles[idx] for idx in range(self.n_player)}, day=self.day,
-                                 time=self.get_time(), event='god_view'))
-        self.game_log.append(Log(viewer=self.WOLF_IDX, source=-1, target=self.WOLF_IDX,
-                                 content={'wolf_team': self.WOLF_IDX}, day=self.day,
-                                 time=self.get_time(), event='werewolf_team_info'))
-        for idx, role in enumerate(self.roles):
-            self.game_log.append(Log(viewer=[idx, ], source=-1, target=idx, content={'identity': self.roles[idx]},
-                                     day=self.day, time=self.get_time(),
-                                     event='self_identity'))
-
-        self.current_act_idx = self.WOLF_IDX[0]
-        self.phase = 'skill_wolf'
-        self.day_or_night = 'night'
-        observation = self.get_observation()
-        return observation
+        self._emit(
+            setting_event,
+            value={"roles": dict(Counter(self.roles)), "players": 7, "wolves": 2},
+        )
+        for player_id, role in enumerate(self.roles, start=1):
+            self._emit(
+                self_role_event,
+                visible_to=[player_id],
+                target=player_id,
+                value=role,
+            )
+        team_event = self._emit(
+            wolf_team_event,
+            visible_to=self.wolves,
+            target=self.wolves,
+            value={"role": "Werewolf"},
+        )
+        self._collect(team_event)
+        self._start_night()
+        return self.get_observation()
 
     def step(self, action):
-        observation, reward, done, info = self.next_phase(action)
-        return observation, reward, done, info
-
-    def next_phase(self, action):
+        if self.phase == "end_game":
+            raise RuntimeError("cannot step a completed game")
+        action_type, action_value = self._validate_action(action)
+        reward = [0] * 7
         done = False
-        reward = [0 for _ in range(self.n_player)]
         info = {}
 
-        action = self.trans_action_agt_to_env(action)
-        action_type = action[0]
-        action_content = action[1]
-
-        if self.phase == 'skill_wolf':
-            assert self.current_act_idx in self.WOLF_IDX
-            assert type(action_content) == int and -1 <= action_content < self.n_player 
-            if action_content >= 0:
-                assert self.alive[action_content] == 1
-
-            self.single_werewolf_kill_target[self.WOLF_IDX.index(self.current_act_idx)][
-                self.get_phase(self.day, self.day_or_night, self.phase)] = action_content
-            self.game_log.append(
-                Log(viewer=[idx for idx in self.WOLF_IDX], source=self.current_act_idx, target=action_content,
-                    content={'kill_target': action_content},
-                    day=self.day, time=self.get_time(), event=self.phase))
-
-            tmp_idx = self.WOLF_IDX.index(self.current_act_idx)
-            if tmp_idx < len(self.WOLF_IDX) - 1 and self.alive[self.WOLF_IDX[tmp_idx + 1]] == 1:
-                self.current_act_idx = self.WOLF_IDX[tmp_idx + 1]
-                self.phase = 'skill_wolf'
-            else:
-                kill_candidate = [target.get(self.get_phase(self.day, self.day_or_night, 'skill_wolf'), -1) for target
-                                  in self.single_werewolf_kill_target]
-                kill_condidate_counter = Counter(kill_candidate)
-                del kill_condidate_counter[-1]
-                wolf_kill_idx = -1
-
-                if len(kill_condidate_counter) > 0:
-                    most_count = kill_condidate_counter.most_common(1)[0]
-                    if list(kill_condidate_counter.values()).count(most_count[1]) > 1:
-                        for i in range(len(kill_candidate) - 1, -1, -1):
-                            if kill_candidate[i] != -1:
-                                wolf_kill_idx = kill_candidate[i]
-                                break
-                    else:
-                        wolf_kill_idx = most_count[0]
-                self.werewolf_kill_decision[self.get_phase(self.day, self.day_or_night, self.phase)] = wolf_kill_idx
-                self.game_log.append(Log(viewer=self.WOLF_IDX + ([self.WITCH_IDX] if self.WITCH_IDX != -1 else []), source=-1, target=wolf_kill_idx,
-                                         content={'kill_decision': wolf_kill_idx}, day=self.day,
-                                         time=self.get_time(),
-                                         event='kill_decision'))
-
-                if self.alive[self.SEER_IDX] == 1:
-                    self.current_act_idx = self.SEER_IDX
-                    self.phase = 'skill_seer'
-                elif self.GUARD_IDX != -1 and self.alive[self.GUARD_IDX] == 1:
-                    self.current_act_idx = self.GUARD_IDX
-                    self.phase = 'skill_guard'
-                elif self.WITCH_IDX != -1 and self.alive[self.WITCH_IDX] == 1:
-                    self.current_act_idx = self.WITCH_IDX
-                    self.phase = 'skill_witch'
-                else:
-                    reward, done, info = self.end_night()
-        elif self.phase == 'skill_seer':
-            assert self.current_act_idx == self.SEER_IDX
-            assert type(action_content) == int and -1 <= action_content < self.n_player 
-            self.seer_check_target[self.get_phase(self.day, self.day_or_night, self.phase)] = action_content
-            checked_identity = None
-            if action_content>=0:
-                checked_identity = 'bad' if self.roles[action_content] == 'Werewolf' else 'good'
-            self.game_log.append(
-                Log(viewer=[self.SEER_IDX, ], source=self.current_act_idx, target=action_content,
-                    content={'cheked_identity': checked_identity},
-                    day=self.day, time=self.get_time(), event=self.phase))
-            if self.GUARD_IDX != -1 and self.alive[self.GUARD_IDX] == 1:
-                self.current_act_idx = self.GUARD_IDX
-                self.phase = 'skill_guard'
-            elif self.WITCH_IDX != -1 and self.alive[self.WITCH_IDX] == 1:
-                self.current_act_idx = self.WITCH_IDX
-                self.phase = 'skill_witch'
-            else:
-                reward, done, info = self.end_night()
-        elif self.phase == 'skill_guard':
-            assert self.current_act_idx == self.GUARD_IDX
-            assert type(action_content) == int and -1 <= action_content < self.n_player 
-            self.guard_target[self.get_phase(self.day, self.day_or_night, self.phase)] = action_content
-            self.game_log.append(
-                Log(viewer=[self.GUARD_IDX, ], source=self.current_act_idx, target=action_content,
-                    content={'protected': action_content}, day=self.day,
-                    time=self.get_time(), event=self.phase))
-            if self.WITCH_IDX != -1 and self.alive[self.WITCH_IDX] == 1:
-                self.current_act_idx = self.WITCH_IDX
-                self.phase = 'skill_witch'
-            else:
-                reward, done, info = self.end_night()
-        elif self.phase == 'skill_witch':
-            assert self.current_act_idx == self.WITCH_IDX
-            assert type(action_content) == int and -1 <= action_content < self.n_player 
-            if action_type == 'witch_heal':
-                assert action_content != -1
-                self.witch_heal_target[self.get_phase(self.day, self.day_or_night, self.phase)] = action_content
-                self.game_log.append(
-                    Log(viewer=[self.WITCH_IDX, ], source=self.current_act_idx, target=action_content,
-                        content={'heal': action_content}, day=self.day,
-                        time=self.get_time(), event=self.phase))
-            elif action_type == 'witch_poison':
-                assert action_content != -1
-                self.witch_poison_target[self.get_phase(self.day, self.day_or_night, self.phase)] = action_content
-                self.game_log.append(
-                    Log(viewer=[self.WITCH_IDX, ], source=self.current_act_idx, target=action_content,
-                        content={'poison': action_content}, day=self.day,
-                        time=self.get_time(), event=self.phase))
-            elif action_type == 'witch_pass':
-                self.game_log.append(
-                    Log(viewer=[self.WITCH_IDX, ], source=self.current_act_idx, target=-1,
-                        content={'pass': -1}, day=self.day,
-                        time=self.get_time(), event=self.phase))
-            else:
-                raise ValueError
-            reward, done, info = self.end_night()
-        elif self.phase == 'speech' or self.phase == 'speech_pk':
-            assert action_type == 'speech' or action_type == 'speech_pk'
-            try:
-                parsed_claims = self.speech_perceiver.parse(
-                    speaker=self.current_act_idx + 1,
-                    speech=action_content,
-                    day=self.day,
-                    phase=self.phase,
-                )
-            except Exception:
-                parsed_claims = []
-            if not isinstance(parsed_claims, list):
-                parsed_claims = []
-            self.game_log.append(
-                Log(viewer=[i for i in range(self.n_player)], source=self.current_act_idx,
-                    target=[i for i in range(self.n_player)],
-                    content={'speech_content': action_content,
-                             'parsed_claims': parsed_claims}, day=self.day,
-                    time=self.get_time(), event=self.phase))
-            if len(self.speech_queue) > 0:
-                self.current_act_idx = self.speech_queue.pop(0)
-            else:
-                self.phase = 'vote' if self.phase == 'speech' else 'vote_pk'
-                if self.phase == 'vote_pk':
-                    assert len(self.vote_queue) > 0
-                else:
-                    assert len(self.vote_queue) == 0
-                    self.vote_queue = [idx for idx, live in enumerate(self.alive) if live == 1.]
-                    assert len(self.vote_queue) > 0
-                self.current_act_idx = self.vote_queue.pop(0)
-        elif self.phase == 'vote' or self.phase == 'vote_pk':
-            assert (action_type == 'vote' or action_type == 'vote_pk') and -1 <= action_content < self.n_player 
-            self.game_log.append(
-                Log(viewer=[-1,], source=self.current_act_idx,
-                    target=action_content,
-                    content={'vote_target': action_content}, day=self.day,
-                    time=self.get_time(), event=self.phase))
-            self.vote_target[self.current_act_idx][
-                self.get_phase(self.day, self.day_or_night, self.phase)] = action_content
-            if len(self.vote_queue) > 0:
-                self.current_act_idx = self.vote_queue.pop(0)
-            else:
-                reward, done, info = self.end_vote()
+        if self.phase == "skill_wolf":
+            self._wolf_action(action_type, action_value)
+            reward, done, info = self._advance_after_wolf()
+        elif self.phase == "skill_seer":
+            self._seer_action(action_type, action_value)
+            reward, done, info = self._advance_after_seer()
+        elif self.phase == "skill_guard":
+            self._guard_action(action_type, action_value)
+            reward, done, info = self._advance_after_guard()
+        elif self.phase == "skill_witch":
+            self._witch_action(action_type, action_value)
+            reward, done, info = self._end_night()
+        elif self.phase in ("speech", "speech_pk"):
+            self._speech_action(action_type, action_value)
+        elif self.phase in ("vote", "vote_pk"):
+            self._vote_action(action_type, action_value)
+            if not self.vote_queue:
+                reward, done, info = self._end_vote()
         else:
-            raise ValueError("Unknown game phase {}".format(self.phase))
+            raise RuntimeError(f"unknown phase: {self.phase}")
 
         if done:
-            self.phase = 'end_game'
-            self.game_log.append(Log(viewer=[idx for idx in range(self.n_player)], source=-1, target=-1,
-                                     content={'outcome': info['Werewolf']}, day=self.day, time=self.get_time(),
-                                     event=self.phase))
-            if self.log_save_path is not None:
-                if not os.path.exists(self.log_save_path):
-                    os.mkdir(self.log_save_path)
-                with open(os.path.join(self.log_save_path, f'game_log.json'), 'w', encoding='utf-8') as file:
-                    tmp_logs = deepcopy(self.game_log)
-                    self.trans_obs_env_to_agt(tmp_logs)
-                    tmp_game_log = [log.__dict__ for log in tmp_logs]
-                    logs = json.dumps(tmp_game_log, ensure_ascii=False, indent=4)
-                    file.write(logs)
-
+            self._finish(info)
         return self.get_observation(), reward, done, info
 
-    def end_night(self):
-        wolf_kill_idx = -1
-        guard_protect_idx = -1
-        witch_heal_idx = -1
-        witch_poison_idx = -1
+    def _validate_action(self, action):
+        if not isinstance(action, tuple) or len(action) != 2 or not isinstance(action[0], str):
+            raise ValueError("action must be a (type, value) tuple")
+        if self.phase in ("speech", "speech_pk"):
+            if action[0] != self.phase or not isinstance(action[1], str):
+                raise ValueError(f"{self.phase} action must contain an utterance string")
+            return action
+        if action not in self.valid_actions():
+            raise ValueError(f"invalid action {action!r}; expected one of {self.valid_actions()!r}")
+        return action
 
-        wolf_kill_idx = self.werewolf_kill_decision.get(self.get_phase(self.day, self.day_or_night, 'skill_wolf'))
+    def _start_night(self):
+        self.day_or_night = "night"
+        self.phase = "skill_wolf"
+        self.night_wolf_choices = []
+        self.night_kill = None
+        self.guard_target = None
+        self.witch_heal_target = None
+        self.witch_poison_target = None
+        living_wolves = [player_id for player_id in self.wolves if player_id in self.alive]
+        if not living_wolves:
+            raise RuntimeError("night cannot start without a living wolf")
+        self.wolf_queue = living_wolves
+        self.current_player = self.wolf_queue.pop(0)
 
-        if self.GUARD_IDX != -1:
-            guard_protect_idx = self.guard_target.get(self.get_phase(self.day, self.day_or_night, 'skill_guard'), -1)
-        if self.WITCH_IDX != -1:
-            witch_heal_idx = self.witch_heal_target.get(self.get_phase(self.day, self.day_or_night, 'skill_witch'), -1)
-            witch_poison_idx = self.witch_poison_target.get(self.get_phase(self.day, self.day_or_night, 'skill_witch'),
-                                                            -1)
-            assert witch_heal_idx == -1 or witch_poison_idx == -1
+    def _wolf_action(self, action_type, target):
+        if action_type != "kill":
+            raise ValueError("wolf phase requires kill")
+        self.night_wolf_choices.append((self.current_player, target or None))
+        self._emit(
+            private_action_event,
+            visible_to=self.wolves,
+            speaker=self.current_player,
+            target=target or None,
+            value={"action": "KILL", "status": "pass" if target == 0 else "chosen"},
+        )
 
-        dead_idx = set()
-        if wolf_kill_idx != -1:
-            dead_idx.add(wolf_kill_idx)
-        if guard_protect_idx == wolf_kill_idx and guard_protect_idx in dead_idx:
-            dead_idx.remove(guard_protect_idx)
-        if witch_heal_idx == wolf_kill_idx and witch_heal_idx in dead_idx:
-            dead_idx.remove(witch_heal_idx)
-        if witch_heal_idx == guard_protect_idx and witch_heal_idx != -1:
-            dead_idx.add(witch_heal_idx)
-        if witch_poison_idx != -1:
-            dead_idx.add(witch_poison_idx)
+    def _advance_after_wolf(self):
+        if self.wolf_queue:
+            self.current_player = self.wolf_queue.pop(0)
+            return [0] * 7, False, {}
+        targets = [target for _, target in self.night_wolf_choices if target is not None]
+        if targets:
+            counts = Counter(targets)
+            maximum = max(counts.values())
+            tied = {target for target, count in counts.items() if count == maximum}
+            self.night_kill = next(target for target in reversed(targets) if target in tied)
+        if self.seer in self.alive:
+            self.phase = "skill_seer"
+            self.current_player = self.seer
+            return [0] * 7, False, {}
+        return self._advance_after_seer()
 
-        for dead in list(dead_idx):
-            self.alive[dead] = 0.
+    def _seer_action(self, action_type, target):
+        if action_type != "check":
+            raise ValueError("seer phase requires check")
+        if target:
+            self.seer_checked.add(target)
+        event = self._emit(
+            check_result_event,
+            visible_to=[self.seer],
+            speaker=self.seer,
+            target=target or None,
+            value={
+                "camp": (
+                    "Werewolf" if target and self._role(target) == "Werewolf" else
+                    "Village" if target else "unknown"
+                )
+            },
+        )
+        self._collect(event)
 
-        self.game_log.append(
-            Log(viewer=[i for i in range(self.n_player)], source=-1, target=list(dead_idx),
-                content={'dead_list': list(dead_idx)}, day=self.day,
-                time=self.get_time(), event='end_night'))
+    def _advance_after_seer(self):
+        if self.guard is not None and self.guard in self.alive:
+            self.phase = "skill_guard"
+            self.current_player = self.guard
+            return [0] * 7, False, {}
+        return self._advance_after_guard()
 
+    def _guard_action(self, action_type, target):
+        if action_type != "guard":
+            raise ValueError("guard phase requires guard")
+        self.guard_target = target or None
+        if self.guard_target is not None:
+            self.guard_history.append(self.guard_target)
+        event = self._emit(
+            guard_result_event,
+            visible_to=[self.guard],
+            speaker=self.guard,
+            target=target or None,
+            value={"action": "GUARD", "status": "pass" if target == 0 else "protected"},
+        )
+        self._collect(event)
+
+    def _advance_after_guard(self):
+        if self.witch is not None and self.witch in self.alive:
+            self.phase = "skill_witch"
+            self.current_player = self.witch
+            event = self._emit(
+                witch_state_event,
+                visible_to=[self.witch],
+                target=self.night_kill,
+                value={
+                    "kill_target": self.night_kill,
+                    "heal_available": not self.witch_heal_used,
+                    "poison_available": not self.witch_poison_used,
+                },
+            )
+            self._collect(event)
+            return [0] * 7, False, {}
+        return self._end_night()
+
+    def _witch_action(self, action_type, target):
+        if action_type == "witch_heal":
+            self.witch_heal_used = True
+            self.witch_heal_target = target
+        elif action_type == "witch_poison":
+            self.witch_poison_used = True
+            self.witch_poison_target = target
+        elif action_type != "witch_pass":
+            raise ValueError("invalid witch action")
+        self._emit(
+            private_action_event,
+            visible_to=[self.witch],
+            speaker=self.witch,
+            target=target or None,
+            value={"action": action_type.upper(), "status": "pass" if target == 0 else "used"},
+        )
+
+    def _end_night(self):
+        dead = set()
+        if self.night_kill is not None:
+            dead.add(self.night_kill)
+        if self.guard_target == self.night_kill:
+            dead.discard(self.night_kill)
+        if self.witch_heal_target == self.night_kill:
+            dead.discard(self.night_kill)
+        if self.guard_target is not None and self.guard_target == self.witch_heal_target:
+            dead.add(self.guard_target)
+        if self.witch_poison_target is not None:
+            dead.add(self.witch_poison_target)
+        dead &= self.alive
+        self.alive -= dead
+        event = self._emit(
+            death_event,
+            target=sorted(dead),
+            value={"players": sorted(dead), "cause": "night"},
+        )
+        self._collect(event)
+        reward, done, info = self._is_done()
+        if done:
+            return reward, done, info
         self.day += 1
-        self.day_or_night = 'day'
-
-        reward, done, info = self.is_done()
-        if done:
-            return reward, done, info
-
-        self.phase = 'speech'
-        tmp_speech_queue = [idx for idx, live in enumerate(self.alive) if live == 1]
-        assert len(tmp_speech_queue) > 0
-        speak_n = random.randint(0, len(tmp_speech_queue))
-        self.speech_queue = tmp_speech_queue[speak_n:] + tmp_speech_queue[:speak_n]
-        self.current_act_idx = self.speech_queue.pop(0)
+        self.day_or_night = "day"
+        self.phase = "speech"
+        self.speech_queue = self._rotated(sorted(self.alive))
+        self.current_player = self.speech_queue.pop(0)
         return reward, done, info
 
-    def end_vote(self):
-        for log in self.game_log:
-            if 'vote' in log.event:
-                log.viewer = [i for i in range(self.n_player)]
+    def _rotated(self, players):
+        if not players:
+            return []
+        offset = self.rng.randrange(len(players))
+        return players[offset:] + players[:offset]
 
-        expelled_target = -1
-        if self.phase == 'vote':
-            vote_candidate = [target.get(self.get_phase(self.day, self.day_or_night, 'vote'), -1) for target in
-                              self.vote_target]
-
-            vote_candidate_counter = Counter(vote_candidate)
-            del vote_candidate_counter[-1]
-            if len(vote_candidate_counter) == 0:
-                expelled_target = -1
-                self.game_log.append(Log(viewer=[idx for idx in range(self.n_player)], source=-1, target=-1,
-                                         content={'vote_outcome': 'all abstention'}, day=self.day,
-                                         time=self.get_time(),
-                                         event='end_vote'))
+    def _speech_action(self, action_type, utterance):
+        expected = self.phase
+        if action_type != expected:
+            raise ValueError(f"{self.phase} requires {expected}")
+        utterance_id = self._next_event_id(prefix="u")
+        raw_event = speech_event(
+            event_id=utterance_id,
+            utterance_id=utterance_id,
+            day=self.day,
+            phase=self._phase_label(),
+            turn=self.event_counter,
+            speaker=self.current_player,
+            target=self.current_player,
+            value=utterance,
+            source_span=utterance,
+        )
+        self.events.append(raw_event)
+        if self.speech_parser is not None and utterance:
+            result = self.speech_parser.parse(
+                utterance=utterance,
+                utterance_id=utterance_id,
+                day=self.day,
+                phase=self._phase_label(),
+                turn=self.event_counter,
+                speaker=self.current_player,
+            )
+            if result.status == "ok":
+                self.events.extend(result.events)
             else:
-                most_count = vote_candidate_counter.most_common(1)[0]
-                if list(vote_candidate_counter.values()).count(most_count[1]) > 1:
-                    tmp_speech_queue = []
-                    for player_idx, vote_count in vote_candidate_counter.items():
-                        if vote_count == most_count[1]:
-                            tmp_speech_queue.append(player_idx)
-                    assert len(tmp_speech_queue) > 1
-                    tmp_speech_queue.sort()
-                    speak_n = random.randint(0, len(tmp_speech_queue))
-                    self.speech_queue = tmp_speech_queue[speak_n:] + tmp_speech_queue[:speak_n]
-
-                    self.vote_queue = []
-                    for player_idx in range(self.n_player):
-                        if self.alive[player_idx] == 1 and player_idx not in self.speech_queue:
-                            self.vote_queue.append(player_idx)
-
-                    if len(self.vote_queue) == 0:
-                        self.vote_queue = deepcopy(self.speech_queue)
-                        self.vote_queue.sort()
-                    self.vote_pk_players = deepcopy(self.speech_queue)
-
-                    self.game_log.append(Log([idx for idx in range(self.n_player)], source=-1, target=-1,
-                                             content={'vote_outcome': 'draw',
-                                                      'speech_queue': deepcopy(
-                                                          self.speech_queue),
-                                                      'vote_queue': deepcopy(
-                                                          self.vote_queue)},
-                                             day=self.day, time=self.get_time(),
-                                             event='end_vote'))
-
-                    self.current_act_idx = self.speech_queue.pop(0)
-                    self.phase = 'speech_pk'
-                    reward, done, info = self.is_done()
-                    return reward, done, info
-                else:
-                    expelled_target = most_count[0]
-        elif self.phase == 'vote_pk':
-            vote_pk_candidate = [target.get(self.get_phase(self.day, self.day_or_night, 'vote_pk'), -1) for target
-                                 in self.vote_target]
-            vote_pk_candidate_counter = Counter(vote_pk_candidate)
-            del vote_pk_candidate_counter[-1]
-            if len(vote_pk_candidate_counter) == 0:
-                expelled_target = -1
-                self.game_log.append(Log(viewer=[idx for idx in range(self.n_player)], source=-1, target=-1,
-                                         content={'vote_outcome': 'all abstention in pk'}, day=self.day,
-                                         time=self.get_time(),
-                                         event='end_vote'))
-            else:
-                most_count = vote_pk_candidate_counter.most_common(1)[0]
-                if list(vote_pk_candidate_counter.values()).count(most_count[1]) > 1:
-                    expelled_target = -1
-                    self.game_log.append(Log(viewer=[idx for idx in range(self.n_player)], source=-1, target=-1,
-                                             content={'vote_outcome': 'draw in pk'},
-                                             day=self.day, time=self.get_time(),
-                                             event='end_vote'))
-                else:
-                    expelled_target = most_count[0]
+                self.parser_failures.append(
+                    {
+                        "utterance_id": utterance_id,
+                        "raw_text": list(result.raw_text),
+                        "error": result.error,
+                        "attempts": result.attempts,
+                    }
+                )
+        self._collect(raw_event)
+        if self.speech_queue:
+            self.current_player = self.speech_queue.pop(0)
+            return
+        self.phase = "vote" if self.phase == "speech" else "vote_pk"
+        if self.phase == "vote":
+            self.vote_queue = sorted(self.alive)
         else:
-            raise ValueError
+            voters = [player_id for player_id in sorted(self.alive) if player_id not in self.vote_pk_players]
+            self.vote_queue = voters or sorted(self.vote_pk_players)
+        self.current_votes = {}
+        self.current_player = self.vote_queue.pop(0)
 
+    def _vote_action(self, action_type, target):
+        if action_type != self.phase:
+            raise ValueError(f"{self.phase} requires {self.phase}")
+        self.current_votes[self.current_player] = target or None
+        event = self._emit(
+            vote_event,
+            speaker=self.current_player,
+            target=target or None,
+            value={"action": "VOTE", "target": target or None, "round": self.phase},
+        )
+        self._collect(event)
+        if self.vote_queue:
+            self.current_player = self.vote_queue.pop(0)
 
-        if expelled_target != -1:
-            assert self.alive[expelled_target] == 1
-            self.alive[expelled_target] = 0
-            self.game_log.append(
-                Log(viewer=[i for i in range(self.n_player)], source=-1,
-                    target=expelled_target,
-                    content={'vote_outcome': expelled_target,
-                             'expelled': expelled_target}, day=self.day,
-                    time=self.get_time(), event='end_vote'))
+    def _end_vote(self):
+        counts = Counter(target for target in self.current_votes.values() if target is not None)
+        leaders = []
+        if counts:
+            maximum = max(counts.values())
+            leaders = sorted(target for target, count in counts.items() if count == maximum)
+        result_event = self._emit(
+            vote_result_event,
+            target=leaders,
+            value={"counts": dict(counts), "leaders": leaders, "round": self.phase},
+        )
+        self._collect(result_event)
+        if self.phase == "vote" and len(leaders) > 1:
+            self.vote_pk_players = leaders
+            self.phase = "speech_pk"
+            self.speech_queue = self._rotated(leaders)
+            self.current_player = self.speech_queue.pop(0)
+            return [0] * 7, False, {}
 
-        reward, done, info = self.is_done()
+        expelled = leaders[0] if len(leaders) == 1 else None
+        if expelled is not None:
+            self.alive.remove(expelled)
+            exile = self._emit(
+                exile_event,
+                target=expelled,
+                value={"player": expelled},
+            )
+            self._collect(exile)
+            reveal = self._emit(
+                role_reveal_event,
+                target=expelled,
+                value={"role": self._role(expelled)},
+            )
+            self._collect(reveal)
+        reward, done, info = self._is_done()
         if done:
             return reward, done, info
-
-        self.phase = 'skill_wolf'
-        for idx in self.WOLF_IDX:
-            if self.alive[idx] == 1:
-                self.current_act_idx = idx
-                break
-        self.day_or_night = 'night'
+        self._start_night()
         return reward, done, info
 
-    def is_done(self):
-        wolf_count = 0
-        villager_count = 0
-        god_count = 0
-        for idx, role in enumerate(self.roles):
-            if self.alive[idx] == 1.:
-                if role == 'Werewolf':
-                    wolf_count += 1
-                elif role == 'Villager':
-                    villager_count += 1
-                else:
-                    god_count += 1
-        if wolf_count == 0:
-            done = True
-            reward = [-self.werewolf_reward if role == 'Werewolf' else self.village_reward for role in self.roles]
-            info = {'Werewolf': -1}
-        elif villager_count == 0 or god_count == 0:
-            done = True
-            reward = [self.werewolf_reward if role == 'Werewolf' else -self.village_reward for role in self.roles]
-            info = {'Werewolf': 1}
+    def _is_done(self):
+        living_roles = [self._role(player_id) for player_id in self.alive]
+        wolves = living_roles.count("Werewolf")
+        villagers = living_roles.count("Villager")
+        special = len(living_roles) - wolves - villagers
+        if wolves == 0:
+            return (
+                [-self.werewolf_reward if role == "Werewolf" else self.village_reward for role in self.roles],
+                True,
+                {"Werewolf": -1},
+            )
+        if villagers == 0 or special == 0:
             self.wolf_win_count += 1
-        else:
-            done = False
-            reward = [0 for _ in range(self.n_player)]
-            info = {}
-        return reward, done, info
+            return (
+                [self.werewolf_reward if role == "Werewolf" else -self.village_reward for role in self.roles],
+                True,
+                {"Werewolf": 1},
+            )
+        return [0] * 7, False, {}
+
+    def _finish(self, info):
+        self.phase = "end_game"
+        self.day_or_night = "day"
+        self.current_player = None
+        self._emit(
+            outcome_event,
+            value={"winner": "Werewolf" if info["Werewolf"] == 1 else "Village"},
+        )
+        if self.log_save_path:
+            path = Path(self.log_save_path)
+            path.mkdir(parents=True, exist_ok=True)
+            with (path / "game_events.json").open("w", encoding="utf-8") as output:
+                json.dump(self.events, output, ensure_ascii=False, indent=2)
+            if self.parser_failures:
+                with (path / "parser_failures.json").open("w", encoding="utf-8") as output:
+                    json.dump(self.parser_failures, output, ensure_ascii=False, indent=2)
+
+    def valid_actions(self):
+        if self.phase == "skill_wolf":
+            targets = sorted(self.alive - set(self.wolves))
+            return [("kill", 0)] + [("kill", target) for target in targets]
+        if self.phase == "skill_seer":
+            targets = sorted(self.alive - self.seer_checked - {self.seer})
+            return [("check", 0)] + [("check", target) for target in targets]
+        if self.phase == "skill_guard":
+            targets = sorted(self.alive)
+            if self.guard_history:
+                targets = [target for target in targets if target != self.guard_history[-1]]
+            return [("guard", 0)] + [("guard", target) for target in targets]
+        if self.phase == "skill_witch":
+            actions = [("witch_pass", 0)]
+            if not self.witch_poison_used:
+                actions.extend(
+                    ("witch_poison", target)
+                    for target in sorted(self.alive - {self.witch})
+                )
+            if not self.witch_heal_used and self.night_kill is not None:
+                actions.append(("witch_heal", self.night_kill))
+            return actions
+        if self.phase in ("speech", "speech_pk"):
+            return [(self.phase, "")]
+        if self.phase == "vote":
+            return [("vote", 0)] + [("vote", target) for target in sorted(self.alive)]
+        if self.phase == "vote_pk":
+            return [("vote_pk", 0)] + [("vote_pk", target) for target in self.vote_pk_players]
+        return []
 
     def get_observation(self):
-        game_log = []
-        for log in self.game_log:
-            if self.current_act_idx in log.viewer:
-                game_log.append(deepcopy(log))
-
-        if self.phase == 'skill_wolf':
-            valid_action = [('kill', -1)] + [('kill', idx) for idx, is_live in enumerate(self.alive) if is_live == 1]
-        elif self.phase == 'skill_seer':
-            valid_action = [('check', -1)] + [('check', idx) for idx, is_live in enumerate(self.alive) if
-                                              is_live == 1 and idx not in self.seer_check_target.values()]
-        elif self.phase == 'skill_guard':
-            valid_action = [('guard', -1)] + [('guard', idx) for idx, is_live in enumerate(self.alive) if is_live == 1]
-            last_guard = self.guard_target.get(self.get_phase(self.day - 1, 'night', 'skill_guard'), None)
-            if ('guard', last_guard) in valid_action:
-                valid_action.remove(('guard', last_guard))
-        elif self.phase == 'skill_witch':
-            valid_action = [('witch_pass', -1)]
-            wolf_kill_decision = self.werewolf_kill_decision.get(self.get_phase(self.day, 'night', 'skill_wolf'), -1)
-            if len(self.witch_poison_target) == 0:
-                valid_action += [('witch_poison', idx) for idx, is_live in enumerate(self.alive) if is_live == 1]
-            if len(self.witch_heal_target) == 0 and wolf_kill_decision != -1:
-                valid_action.append(('witch_heal', wolf_kill_decision))
-        elif self.phase == 'speech':
-            valid_action = ("speech", -1)
-        elif self.phase == 'speech_pk':
-            valid_action = ("speech_pk", -1)
-        elif self.phase == 'vote':
-            valid_action = [('vote', -1)] + [('vote', idx) for idx, is_live in enumerate(self.alive) if is_live == 1]
-        elif self.phase == 'vote_pk':
-            assert len(self.vote_pk_players) > 0
-            valid_action = [('vote_pk', -1)] + [('vote_pk', idx) for idx in self.vote_pk_players]
-        elif self.phase == 'end_game':
-            valid_action = []
-        else:
-            raise ValueError
-        if 'speech' not in self.phase:
-            valid_action = [(action_type, action_content + 1) for (action_type, action_content) in valid_action]
-
-        observation = {'current_act_idx': self.current_act_idx + 1,
-                       'identity': self.roles[self.current_act_idx],
-                       'game_log': self.trans_obs_env_to_agt(game_log),
-                       'phase': self.get_phase(self.day, self.day_or_night, self.phase),
-                       'valid_action': valid_action,
-                       }
-        return observation
-
-    def get_phase(self, day, day_or_night, phase):
-        return str(day) + '_' + day_or_night + '_' + phase
-
-    def get_time(self):
-        return '第' + str(self.day) + '天' + ('白天' if self.day_or_night == 'day' else '夜晚')
-
-    def trans_obs_env_to_agt(self, game_log):
-        for log in game_log:
-            log.viewer = [idx + 1 for idx in log.viewer]
-            log.source += 1
-            log.target = [idx + 1 for idx in log.target] if type(log.target) is list else log.target + 1
-            for key, value in log.content.items():
-                if log.event == 'game_setting' or log.event == 'end_game' or key == 'parsed_claims':
-                    continue
-                if type(value) is int:
-                    log.content[key] += 1
-                if type(value) is list:
-                    log.content[key] = [idx + 1 for idx in log.content[key]]
-        return game_log
-
-    def trans_action_agt_to_env(self, action):
-        assert type(action) is tuple and len(action) == 2 and type(action[0]) == str
-        action_type = action[0]
-        action_content = action[1]
-        if not action_type.startswith('speech'):
-            assert type(action_content) is int
-            action_content -= 1
-        action = (action_type, action_content)
-        return action
+        if self.phase == "end_game":
+            return {
+                "player_id": None,
+                "role": None,
+                "events": [],
+                "phase": self._phase_label(),
+                "valid_actions": [],
+            }
+        return {
+            "player_id": self.current_player,
+            "role": self._role(self.current_player),
+            "events": visible_events(self.events, self.current_player),
+            "phase": self._phase_label(),
+            "valid_actions": self.valid_actions(),
+        }

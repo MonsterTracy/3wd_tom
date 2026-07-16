@@ -6,7 +6,7 @@ class TWDMStrategy:
         if not self.config.get("enable_strategy", True):
             return ""
 
-        identity = observation.get("identity", "")
+        identity = observation.get("role", "")
         phase = observation.get("phase", "")
 
         role_hint = self._build_role_hint(identity)

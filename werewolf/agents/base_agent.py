@@ -1,26 +1,27 @@
+"""Agent interfaces for the structured-event environment."""
+
 import random
+from abc import ABC, abstractmethod
 
-class Agent():
 
+class Agent(ABC):
     def reset(self):
-        raise NotImplementedError
+        return None
 
+    @abstractmethod
     def act(self, observation):
         raise NotImplementedError
 
 
 class RandomAgent(Agent):
-    def __init__(self):
-        pass
-
-    def reset(self):
-        pass
+    def __init__(self, seed=None):
+        self.rng = random.Random(seed)
 
     def act(self, observation):
-        phase = observation['phase']
-        valid_action = observation['valid_action']
-        if 'speech' in phase:
-            action = ('speech', '')
-        else:
-            action = valid_action[random.randint(0, len(valid_action)-1)]
-        return action
+        if "speech" in observation["phase"]:
+            action_type = "speech_pk" if "speech_pk" in observation["phase"] else "speech"
+            return action_type, ""
+        actions = observation["valid_actions"]
+        if not actions:
+            raise RuntimeError("no valid action is available")
+        return self.rng.choice(actions)

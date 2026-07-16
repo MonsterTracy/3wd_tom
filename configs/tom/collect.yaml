@@ -1,0 +1,39 @@
+schema_version: runtime.v1
+seed: 20260716
+games: 1
+max_steps: 256
+backends:
+  main:
+    type: openai_compatible
+    base_url: null
+    api_key_env: OPENAI_API_KEY
+    default_model: gpt-4o-mini
+parser:
+  backend: main
+  model: gpt-4o-mini
+agents:
+  profiles:
+    gameplay:
+      agent_type: gpt4o-mini
+      backend: main
+      model: gpt-4o-mini
+      temperature: 0.7
+      strategy: {}
+  werewolf_profile: gameplay
+  village_profile: gameplay
+environment:
+  n_player: 7
+  n_role: 4
+  n_werewolf: 2
+  n_seer: 1
+  n_witch: 1
+  n_guard: 0
+  n_hunter: 0
+  n_villager: 3
+  werewolf_reward: 1
+  village_reward: 1
+output:
+  samples: data/tom/samples.jsonl
+  failures: data/tom/failures.jsonl
+  logs: logs/tom
+  overwrite: false
