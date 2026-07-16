@@ -1,0 +1,109 @@
+# macOS
+.DS_Store
+
+# Secrets / local env
+.env
+.env.*
+.envrc
+
+# Node / frontend
+node_modules/
+dist/
+build/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python packaging
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / local tooling
+.codegraph/
+.vscode/
+
+# Generated logs and runtime outputs
+logs/
+*.log
+runs/
+outputs/
+artifacts/
+mlruns/
+tensorboard/
+lightning_logs/
+wandb/
+
+# Model checkpoints and large artifacts
+checkpoints/
+archive/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Runtime outputs
+logs/
+log/
+runs/
+wandb/
+outputs/
+output/
+checkpoints/
+checkpoint/
+
+# Model weights and caches
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+.cache/
+huggingface/
+model_cache/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+checkpoints/
