@@ -5,12 +5,15 @@ import sys
 from copy import deepcopy
 from itertools import combinations
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 import script.tom.collect as collect_module
 from script.tom.collect import collect_from_config, preflight_collection
+from werewolf.backends.base import BackendError
+from werewolf.backends.openai_compatible import OpenAICompatibleBackend
 from werewolf.prompt_protocol import (
     BELIEF_SYSTEM_PROMPT,
     BELIEF_PROMPT_SPEC,
@@ -24,6 +27,188 @@ from werewolf.runtime_config import resolve_collection_output, validate_runtime_
 
 def _config():
     return yaml.safe_load(Path("configs/tom/collect.yaml").read_text(encoding="utf-8"))
+
+
+class FakeCompletions:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.requests = []
+
+    def create(self, **request):
+        self.requests.append(deepcopy(request))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def _fake_openai_backend(outcome):
+    completions = FakeCompletions(outcome)
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+    return OpenAICompatibleBackend(
+        client=client, default_model="deepseek-chat"
+    ), completions
+
+
+def _fake_openai_error(
+    name, *, status_code=None, body=None, request_id=None, headers=None,
+):
+    error_type = type(name, (Exception,), {})
+    error = error_type("unsafe SDK repr must not be serialized")
+    error.status_code = status_code
+    error.body = body
+    error.request_id = request_id
+    error.response = SimpleNamespace(
+        status_code=status_code,
+        headers=headers or {},
+        json=lambda: body,
+    )
+    return error
+
+
+def test_backend_error_keeps_safe_read_only_diagnostics_and_chaining():
+    error = BackendError(
+        "backend failed\ncompactly",
+        retryable=True,
+        details={"cause_type": "RateLimitError", "status_code": 429},
+    )
+    assert error.message == "backend failed compactly"
+    assert error.retryable is True
+    assert error.details == {
+        "cause_type": "RateLimitError", "status_code": 429,
+    }
+    assert "retryable=true" in str(error)
+    assert "cause_type=RateLimitError" in str(error)
+    with pytest.raises(TypeError):
+        error.safe_details["status_code"] = 200
+    with pytest.raises(TypeError, match="safe scalars"):
+        BackendError("bad details", details={"exception": ValueError("secret")})
+
+    cause = _fake_openai_error(
+        "BadRequestError",
+        status_code=400,
+        body={"error": {"message": "bad input", "code": "bad_request"}},
+    )
+    backend, _ = _fake_openai_backend(cause)
+    with pytest.raises(BackendError) as captured:
+        backend.chat([{"role": "user", "content": "private prompt"}])
+    assert captured.value.__cause__ is cause
+
+
+@pytest.mark.parametrize(
+    ("name", "status_code", "expected_retryable"),
+    [
+        ("BadRequestError", 400, False),
+        ("AuthenticationError", 401, False),
+        ("PermissionDeniedError", 403, False),
+        ("NotFoundError", 404, False),
+        ("RateLimitError", 429, True),
+        ("InternalServerError", 500, True),
+        ("APITimeoutError", None, True),
+        ("APIConnectionError", None, True),
+    ],
+)
+def test_openai_backend_classifies_safe_sdk_failures(
+    name, status_code, expected_retryable
+):
+    cause = _fake_openai_error(
+        name,
+        status_code=status_code,
+        body={
+            "error": {
+                "type": "provider_type",
+                "code": "provider_code",
+                "param": "response_format",
+                "message": "safe provider message",
+                "forbidden_extra": "must not survive",
+            },
+            "request_payload": "must not survive",
+        },
+        request_id="req-direct-123",
+    )
+    backend, _ = _fake_openai_backend(cause)
+    with pytest.raises(BackendError) as captured:
+        backend.chat([{"role": "user", "content": "private prompt"}])
+
+    error = captured.value
+    assert error.retryable is expected_retryable
+    assert error.safe_details == {
+        "backend": "openai_compatible",
+        "model": "deepseek-chat",
+        "cause_type": name,
+        "status_code": status_code,
+        "provider_error_type": "provider_type",
+        "provider_error_code": "provider_code",
+        "provider_error_param": "response_format",
+        "request_id": "req-direct-123",
+        "safe_message": "safe provider message",
+    }
+    assert "forbidden_extra" not in str(error)
+    assert "request_payload" not in str(error)
+
+
+def test_openai_backend_extracts_header_request_id_and_redacts_secrets_prompts():
+    secret = "sk-deepseek-super-secret-123"
+    prompt = "SYSTEM PRIVATE PROMPT CONTENT"
+    message = (
+        f"DEEPSEEK_API_KEY={secret}\n"
+        f"Authorization: Bearer {secret}\n{prompt}"
+    )
+    cause = _fake_openai_error(
+        "BadRequestError",
+        status_code=400,
+        body={"error": {"message": message, "code": "invalid_request"}},
+        headers={
+            "X-Request-ID": "req-header-456",
+            "Authorization": f"Bearer {secret}",
+        },
+    )
+    backend, _ = _fake_openai_backend(cause)
+    with pytest.raises(BackendError) as captured:
+        backend.chat([{"role": "system", "content": prompt}])
+
+    rendered = str(captured.value)
+    assert captured.value.safe_details["request_id"] == "req-header-456"
+    assert captured.value.safe_details["provider_error_code"] == "invalid_request"
+    assert secret not in rendered
+    assert prompt not in rendered
+    assert "Authorization: Bearer" not in rendered
+    assert "[REDACTED" in rendered
+
+
+@pytest.mark.parametrize(
+    ("response", "error_code"),
+    [
+        (SimpleNamespace(choices=[]), "empty_choices"),
+        (
+            SimpleNamespace(choices=[SimpleNamespace(message=None)]),
+            "missing_message",
+        ),
+        (
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
+            ),
+            "non_text_content",
+        ),
+        (
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="  "))]
+            ),
+            "empty_content",
+        ),
+    ],
+)
+def test_openai_backend_rejects_deterministic_response_shapes(
+    response, error_code
+):
+    backend, completions = _fake_openai_backend(response)
+    with pytest.raises(BackendError) as captured:
+        backend.chat([{"role": "user", "content": "prompt"}])
+    assert len(completions.requests) == 1
+    assert captured.value.retryable is False
+    assert captured.value.safe_details["cause_type"] == "ResponseShapeError"
+    assert captured.value.safe_details["provider_error_code"] == error_code
 
 
 def test_canonical_collection_config_is_strict():
@@ -252,6 +437,11 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert audit["belief_first_attempt_successes"] == 0
     assert audit["belief_repair_successes"] == audit["unique_belief_elicitations"]
     assert audit["belief_repair_failures"] == 0
+    assert audit["repair_attempts"] == audit["unique_belief_elicitations"]
+    assert audit["belief_backend_failure_count"] == 0
+    assert audit["belief_backend_retry_attempts"] == 0
+    assert audit["belief_backend_retry_successes"] == 0
+    assert audit["belief_backend_retry_failures"] == 0
     assert audit["belief_contains_observer_failures"] == 0
     assert audit["belief_missing_required_wolf_failures"] == 0
     assert audit["belief_contains_forbidden_player_failures"] == 0

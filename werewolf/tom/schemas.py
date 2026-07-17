@@ -363,7 +363,7 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
         if guess["attempts"] == 1 and guess["first_error_code"] is not None:
             raise ValueError("first-attempt success cannot carry an error code")
         if guess["attempts"] == 2 and guess["first_error_code"] is None:
-            raise ValueError("repaired guess requires its first error code")
+            raise ValueError("second-attempt success requires its first error code")
         if not set(guess["required_wolves"]).issubset(pair):
             raise ValueError("successful pair misses a required wolf")
         if set(guess["forbidden_wolves"]) & set(pair):
@@ -373,10 +373,19 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
             raise ValueError("failed guesses cannot carry labels")
         if not guess["error"]:
             raise ValueError("failed guesses require an error")
-        if guess["attempts"] != 2:
-            raise ValueError("failed guesses require both attempts")
-        if guess["first_error_code"] is None or guess["final_error_code"] is None:
-            raise ValueError("failed guesses require first and final error codes")
+        if guess["attempts"] == 1:
+            if (
+                guess["first_error_code"] != "backend_error"
+                or guess["final_error_code"] != "backend_error"
+            ):
+                raise ValueError(
+                    "one-attempt failures must be non-retryable backend errors"
+                )
+        elif (
+            guess["first_error_code"] is None
+            or guess["final_error_code"] is None
+        ):
+            raise ValueError("two-attempt failures require both error codes")
         if require_success:
             raise ValueError("failed belief elicitation is not a training sample")
     return True

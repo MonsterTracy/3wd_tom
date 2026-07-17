@@ -292,7 +292,8 @@ def build_audit_report(
         for record in unique_first.values()
     )
     repair_attempts = sum(
-        max(0, record.get("guess", {}).get("attempts", 1) - 1)
+        record.get("guess", {}).get("attempts") == 2
+        and record.get("guess", {}).get("first_error_code") != "backend_error"
         for record in unique_first.values()
     )
     belief_failure_reasons = Counter()
@@ -304,6 +305,10 @@ def build_audit_report(
     belief_first_attempt_successes = 0
     belief_repair_successes = 0
     belief_repair_failures = 0
+    belief_backend_failure_count = 0
+    belief_backend_retry_attempts = 0
+    belief_backend_retry_successes = 0
+    belief_backend_retry_failures = 0
     invalid_format_codes = {
         "invalid_json",
         "not_exactly_two_players",
@@ -314,10 +319,18 @@ def build_audit_report(
         guess = record.get("guess", {})
         status = guess.get("status")
         attempts = guess.get("attempts")
+        first_error_code = guess.get("first_error_code")
+        final_error_code = guess.get("final_error_code")
+        backend_retry = attempts == 2 and first_error_code == "backend_error"
+        semantic_repair = attempts == 2 and first_error_code != "backend_error"
+        if backend_retry:
+            belief_backend_retry_attempts += 1
         if status == "ok":
             if attempts == 1:
                 belief_first_attempt_successes += 1
-            elif attempts == 2:
+            elif backend_retry:
+                belief_backend_retry_successes += 1
+            elif semantic_repair:
                 belief_repair_successes += 1
             pair = record.get("label_pair") or []
             if (
@@ -328,10 +341,16 @@ def build_audit_report(
             continue
         if status != "failed":
             continue
-        if attempts == 2:
+        if semantic_repair:
             belief_repair_failures += 1
-        error_code = guess.get("final_error_code") or "unknown"
+        if final_error_code == "backend_error":
+            belief_backend_failure_count += 1
+            if backend_retry:
+                belief_backend_retry_failures += 1
+        error_code = final_error_code or "unknown"
         belief_failure_reasons[error_code] += 1
+        if error_code == "backend_error":
+            continue
         pair = _raw_guess_pair(guess)
         required = set(guess.get("required_wolves", ()))
         forbidden = set(guess.get("forbidden_wolves", ()))
@@ -547,6 +566,10 @@ def build_audit_report(
         "belief_first_attempt_successes": belief_first_attempt_successes,
         "belief_repair_successes": belief_repair_successes,
         "belief_repair_failures": belief_repair_failures,
+        "belief_backend_failure_count": belief_backend_failure_count,
+        "belief_backend_retry_attempts": belief_backend_retry_attempts,
+        "belief_backend_retry_successes": belief_backend_retry_successes,
+        "belief_backend_retry_failures": belief_backend_retry_failures,
         "belief_contains_observer_failures": belief_contains_observer_failures,
         "belief_missing_required_wolf_failures": belief_missing_required_wolf_failures,
         "belief_contains_forbidden_player_failures": belief_contains_forbidden_player_failures,
@@ -648,6 +671,7 @@ def assert_audit_passes(report):
         "invalid_ruleset_count",
         "belief_contains_observer_failures",
         "belief_success_constraint_violations",
+        "belief_backend_failure_count",
         "missing_parser_metadata_count",
         "parser_utterance_mismatch_count",
     )

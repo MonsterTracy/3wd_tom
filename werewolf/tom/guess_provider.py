@@ -3,6 +3,7 @@
 import json
 from dataclasses import dataclass
 
+from werewolf.backends.base import BackendError
 from werewolf.prompt_protocol import (
     BELIEF_SYSTEM_PROMPT,
     belief_repair_message,
@@ -177,7 +178,7 @@ class BeliefGuessProvider:
         ]
         for attempt in range(1, 3):
             messages = [dict(message) for message in initial_messages]
-            if attempt == 2 and raw_text:
+            if attempt == 2 and first_error_code != "backend_error":
                 messages.extend(
                     [
                         {"role": "assistant", "content": raw_text[-1]},
@@ -221,9 +222,23 @@ class BeliefGuessProvider:
             except GuessValidationError as exc:
                 final_error_code = exc.code
                 error = f"{type(exc).__name__}: {exc}"
-            except Exception as exc:
+            except BackendError as exc:
                 final_error_code = "backend_error"
                 error = f"{type(exc).__name__}: {exc}"
+                if attempt == 1 and not exc.retryable:
+                    first_error_code = final_error_code
+                    break
+            except Exception as exc:
+                backend_error = BackendError(
+                    "Belief backend raised an unexpected exception.",
+                    retryable=False,
+                    details={"cause_type": type(exc).__name__},
+                )
+                final_error_code = "backend_error"
+                error = f"{type(backend_error).__name__}: {backend_error}"
+                if attempt == 1:
+                    first_error_code = final_error_code
+                    break
             if attempt == 1:
                 first_error_code = final_error_code
         return GuessResult(
@@ -231,7 +246,7 @@ class BeliefGuessProvider:
             pair=None,
             raw_text=tuple(raw_text),
             error=error or "belief elicitation failed",
-            attempts=2,
+            attempts=attempt,
             model=self.model,
             first_error_code=first_error_code,
             final_error_code=final_error_code,

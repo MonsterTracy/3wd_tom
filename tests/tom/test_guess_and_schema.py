@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from werewolf.agents.llm_agent import LLMAgent
+from werewolf.backends.base import BackendError
 from werewolf.events.environment_events import (
     check_result_event,
     death_event,
@@ -66,7 +67,10 @@ class SequenceBackend:
     def chat(self, messages, **kwargs):
         self.calls += 1
         self.messages.append(deepcopy(messages))
-        return next(self.responses)
+        response = next(self.responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def _elicit(provider, *, player_view="view", required=(), forbidden=(3,), mask=None):
@@ -442,16 +446,16 @@ def test_guess_provider_classifies_mask_only_conflict_without_fallback():
     assert result.raw_text == ('{"wolf_pair":[4,5]}', '{"wolf_pair":[4,5]}')
 
 
-def test_guess_provider_does_not_fabricate_assistant_after_backend_error():
-    class ErrorThenSuccessBackend(SequenceBackend):
-        def chat(self, messages, **kwargs):
-            self.calls += 1
-            self.messages.append(deepcopy(messages))
-            if self.calls == 1:
-                raise RuntimeError("temporary backend error")
-            return '{"wolf_pair":[1,2]}'
-
-    backend = ErrorThenSuccessBackend([])
+def test_guess_provider_retries_retryable_backend_with_identical_messages():
+    backend = SequenceBackend(
+        [
+            BackendError(
+                "temporary backend error", retryable=True,
+                details={"cause_type": "APITimeoutError"},
+            ),
+            '{"wolf_pair":[1,2]}',
+        ]
+    )
     result = _elicit(
         BeliefGuessProvider(backend, "agent-model"),
         player_view="legal player view",
@@ -463,6 +467,66 @@ def test_guess_provider_does_not_fabricate_assistant_after_backend_error():
     assert backend.messages[1][0] == {"role": "system", "content": SYSTEM_PROMPT}
     assert "legal player view" in backend.messages[1][1]["content"]
     assert result.first_error_code == "backend_error"
+    assert result.final_error_code is None
+    assert result.raw_text == ('{"wolf_pair":[1,2]}',)
+    assert all(len(messages) == 2 for messages in backend.messages)
+    assert all(
+        "上一条结果非法" not in message["content"]
+        for messages in backend.messages
+        for message in messages
+    )
+
+
+def test_guess_provider_does_not_retry_non_retryable_backend_error():
+    backend = SequenceBackend(
+        [
+            BackendError(
+                "bad request", retryable=False,
+                details={
+                    "cause_type": "BadRequestError", "status_code": 400,
+                    "provider_error_code": "invalid_request",
+                    "safe_message": "response_format is invalid",
+                },
+            )
+        ]
+    )
+    result = _elicit(BeliefGuessProvider(backend, "agent-model"))
+
+    assert result.status == "failed"
+    assert result.attempts == 1
+    assert result.first_error_code == "backend_error"
+    assert result.final_error_code == "backend_error"
+    assert result.raw_text == ()
+    assert backend.calls == 1
+    assert len(backend.messages[0]) == 2
+    assert "cause_type=BadRequestError" in result.error
+    assert "status_code=400" in result.error
+    assert "provider_error_code=invalid_request" in result.error
+    assert "safe_message=response_format is invalid" in result.error
+
+
+def test_guess_provider_records_two_failed_backend_retry_attempts():
+    errors = [
+        BackendError(
+            "rate limited", retryable=True,
+            details={"cause_type": "RateLimitError", "status_code": 429},
+        ),
+        BackendError(
+            "rate limited again", retryable=True,
+            details={"cause_type": "RateLimitError", "status_code": 429},
+        ),
+    ]
+    backend = SequenceBackend(errors)
+    result = _elicit(BeliefGuessProvider(backend, "agent-model"))
+
+    assert result.status == "failed"
+    assert result.attempts == 2
+    assert result.first_error_code == "backend_error"
+    assert result.final_error_code == "backend_error"
+    assert result.raw_text == ()
+    assert backend.calls == 2
+    assert backend.messages[0] == backend.messages[1]
+    assert all(len(messages) == 2 for messages in backend.messages)
 
 
 def test_guess_provider_has_no_gameplay_side_effects():
@@ -482,6 +546,45 @@ def test_guess_provider_has_no_gameplay_side_effects():
     assert result.status == "ok"
     assert (observation, events, agent_state, output_mask) == before
     assert backend.calls == 1
+
+
+def test_guess_schema_distinguishes_backend_retry_from_semantic_repair():
+    original = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
+
+    backend_once = deepcopy(original)
+    backend_once["label_pair"] = None
+    backend_once["label_index"] = None
+    backend_once["guess"].update(
+        status="failed", raw_text=[], error="safe backend error", attempts=1,
+        first_error_code="backend_error", final_error_code="backend_error",
+    )
+    assert validate_sample(backend_once, require_success=False)
+
+    semantic_once = deepcopy(backend_once)
+    semantic_once["guess"].update(
+        raw_text=["bad"], first_error_code="invalid_json",
+        final_error_code="invalid_json",
+    )
+    with pytest.raises(ValueError, match="one-attempt failures"):
+        validate_sample(semantic_once, require_success=False)
+
+    backend_twice = deepcopy(backend_once)
+    backend_twice["guess"]["attempts"] = 2
+    assert validate_sample(backend_twice, require_success=False)
+
+    backend_retry_success = deepcopy(original)
+    backend_retry_success["guess"].update(
+        raw_text=['{"wolf_pair":[1,2]}'], attempts=2,
+        first_error_code="backend_error", final_error_code=None,
+    )
+    assert validate_sample(backend_retry_success)
+
+    semantic_repair_success = deepcopy(original)
+    semantic_repair_success["guess"].update(
+        raw_text=["bad", '{"wolf_pair":[1,2]}'], attempts=2,
+        first_error_code="invalid_json", final_error_code=None,
+    )
+    assert validate_sample(semantic_repair_success)
 
 
 def test_dataset_accepts_only_successful_tom_v1(tmp_path):

@@ -297,6 +297,8 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         "repair_attempts", "first_order_samples", "second_order_public_samples",
         "belief_failure_reason_distribution", "belief_first_attempt_successes",
         "belief_repair_successes", "belief_repair_failures",
+        "belief_backend_failure_count", "belief_backend_retry_attempts",
+        "belief_backend_retry_successes", "belief_backend_retry_failures",
         "belief_contains_observer_failures",
         "belief_missing_required_wolf_failures",
         "belief_contains_forbidden_player_failures",
@@ -333,6 +335,10 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["unique_belief_elicitations"] == 1
     assert report["successful_guesses"] == 1
     assert report["belief_first_attempt_successes"] == 1
+    assert report["belief_backend_failure_count"] == 0
+    assert report["belief_backend_retry_attempts"] == 0
+    assert report["belief_backend_retry_successes"] == 0
+    assert report["belief_backend_retry_failures"] == 0
     assert report["belief_success_rate"] == 1.0
     assert report["belief_repair_success_rate"] == 1.0
     assert report["first_order_samples"] == 1
@@ -513,6 +519,59 @@ def test_failed_guess_is_audited_and_fails_the_quality_gate():
     assert report["belief_repair_success_rate"] == 0.0
     with pytest.raises(RuntimeError, match="belief_success_rate"):
         assert_audit_passes(report)
+
+
+def test_belief_audit_separates_backend_retries_and_semantic_repairs():
+    original = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
+
+    retry_success = deepcopy(original)
+    retry_success["guess"].update(
+        raw_text=['{"wolf_pair":[1,2]}'], attempts=2,
+        first_error_code="backend_error", final_error_code=None,
+    )
+    success_report = build_audit_report([retry_success])
+    assert success_report["repair_attempts"] == 0
+    assert success_report["belief_repair_successes"] == 0
+    assert success_report["belief_backend_retry_attempts"] == 1
+    assert success_report["belief_backend_retry_successes"] == 1
+    assert success_report["belief_backend_retry_failures"] == 0
+    assert success_report["belief_backend_failure_count"] == 0
+    assert success_report["belief_repair_success_rate"] == 1.0
+
+    retry_failure = deepcopy(original)
+    retry_failure["label_pair"] = None
+    retry_failure["label_index"] = None
+    retry_failure["guess"].update(
+        status="failed", raw_text=[], error="safe backend error", attempts=2,
+        first_error_code="backend_error", final_error_code="backend_error",
+    )
+    failure_report = build_audit_report([], [retry_failure])
+    assert failure_report["repair_attempts"] == 0
+    assert failure_report["belief_repair_failures"] == 0
+    assert failure_report["belief_backend_retry_attempts"] == 1
+    assert failure_report["belief_backend_retry_successes"] == 0
+    assert failure_report["belief_backend_retry_failures"] == 1
+    assert failure_report["belief_backend_failure_count"] == 1
+    assert failure_report["belief_invalid_format_failures"] == 0
+    with pytest.raises(RuntimeError, match="belief_backend_failure_count"):
+        assert_audit_passes(failure_report)
+
+    non_retryable = deepcopy(retry_failure)
+    non_retryable["guess"]["attempts"] = 1
+    non_retryable_report = build_audit_report([], [non_retryable])
+    assert non_retryable_report["belief_backend_failure_count"] == 1
+    assert non_retryable_report["belief_backend_retry_attempts"] == 0
+
+    semantic_success = deepcopy(original)
+    semantic_success["guess"].update(
+        raw_text=["bad", '{"wolf_pair":[1,2]}'], attempts=2,
+        first_error_code="invalid_json", final_error_code=None,
+    )
+    semantic_report = build_audit_report([semantic_success])
+    assert semantic_report["repair_attempts"] == 1
+    assert semantic_report["belief_repair_successes"] == 1
+    assert semantic_report["belief_repair_success_rate"] == 1.0
+    assert semantic_report["belief_backend_retry_attempts"] == 0
 
 
 def test_fixed_seven_player_roles_and_both_win_conditions():
