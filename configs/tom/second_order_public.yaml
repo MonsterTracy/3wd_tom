@@ -6,7 +6,7 @@ data:
   mode: public_only
   include_first_order_private: true
 model:
-  architecture: transformer
+  architecture: gpt2block
   d_model: 128
   num_layers: 2
   num_heads: 4

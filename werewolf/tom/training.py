@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from transformers import __version__ as TRANSFORMERS_VERSION
 
 from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
 from werewolf.prompt_protocol import checkpoint_prompt_metadata
@@ -178,7 +179,10 @@ def train_from_config(config):
         }
         history.append(epoch_record)
         checkpoint = {
-            "schema_version": "model.v1",
+            "schema_version": "model.v2",
+            "architecture": model.config.architecture,
+            "transformers_version": TRANSFORMERS_VERSION,
+            "gpt2_config": model.gpt2_config_metadata(),
             "pair_space": [list(pair) for pair in WOLF_PAIRS],
             "event_encoder": {
                 "schema_version": ENCODER_SCHEMA_VERSION,

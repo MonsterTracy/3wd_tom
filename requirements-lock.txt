@@ -4,4 +4,5 @@ openai==2.44.0
 python-dotenv==1.2.2
 PyYAML==6.0.3
 torch==2.12.1
+transformers==5.13.0
 pytest==9.1.1

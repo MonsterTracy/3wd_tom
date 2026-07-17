@@ -13,6 +13,7 @@ setup(
         "python-dotenv>=1.0,<2.0",
         "PyYAML>=6.0,<7.0",
         "torch>=2.0,<3.0",
+        "transformers==5.13.0",
     ],
     extras_require={"dev": ["pytest>=8.0,<10.0"]},
 )

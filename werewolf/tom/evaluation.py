@@ -5,13 +5,14 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from transformers import __version__ as TRANSFORMERS_VERSION
 
 from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
 from werewolf.prompt_protocol import checkpoint_prompt_metadata
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import MODE_IDS, TASK_IDS, collate_features
 from werewolf.tom.metrics import compute_metrics
-from werewolf.tom.model import ToMModel, ToMModelConfig
+from werewolf.tom.model import ARCHITECTURES, ToMModel, ToMModelConfig
 from werewolf.tom.pair_space import WOLF_PAIRS
 from werewolf.tom.training import resolve_device
 
@@ -48,8 +49,16 @@ def evaluate_from_config(config):
     validate_evaluate_config(config)
     device = resolve_device(config["device"])
     checkpoint = torch.load(config["checkpoint"], map_location=device, weights_only=False)
-    if checkpoint.get("schema_version") != "model.v1":
+    if checkpoint.get("schema_version") != "model.v2":
         raise ValueError("unsupported checkpoint schema_version")
+    architecture = checkpoint.get("architecture")
+    if architecture not in ARCHITECTURES:
+        raise ValueError("checkpoint architecture is not canonical")
+    model_config = checkpoint.get("config", {}).get("model")
+    if not isinstance(model_config, dict) or model_config.get("architecture") != architecture:
+        raise ValueError("checkpoint architecture does not match model config")
+    if checkpoint.get("transformers_version") != TRANSFORMERS_VERSION:
+        raise ValueError("checkpoint transformers version is incompatible")
     if checkpoint.get("pair_space") != [list(pair) for pair in WOLF_PAIRS]:
         raise ValueError("checkpoint pair_space does not match the canonical 21 classes")
     expected_encoder = {
@@ -68,7 +77,9 @@ def evaluate_from_config(config):
     )
     if checkpoint.get("prompt_protocol") != expected_prompt_protocol:
         raise ValueError("checkpoint prompt protocol does not match evaluation data")
-    model = ToMModel(ToMModelConfig(**checkpoint["config"]["model"]))
+    model = ToMModel(ToMModelConfig(**model_config))
+    if checkpoint.get("gpt2_config") != model.gpt2_config_metadata():
+        raise ValueError("checkpoint GPT2Config metadata is incompatible")
     model.load_state_dict(checkpoint["model_state"])
     model.to(device).eval()
     loader = DataLoader(

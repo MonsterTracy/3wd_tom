@@ -6,4 +6,5 @@ dependencies:
   - python=3.12
   - pip
   - pip:
+      - transformers==5.13.0
       - -e .[dev]

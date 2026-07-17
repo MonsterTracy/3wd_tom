@@ -173,9 +173,15 @@ python -m script.tom.train --config configs/tom/first_order.yaml
 python -m script.tom.eval --config configs/tom/evaluate.yaml
 ```
 
-Formal model variants are Transformer, GRU, and bag-of-events MLP. The retained
+The canonical sequence backbone is a randomly initialized Hugging Face
+`GPT2Model` whose causal stack consists only of `GPT2Block` layers. It consumes
+the summed structured-event field embeddings through `inputs_embeds`; no
+pretrained checkpoint, tokenizer, text head, or second position embedding is
+used. GRU and bag-of-events MLP remain explicit ablations. `model.v2`
+checkpoints record the exact Transformers version and GPT-2 structure and are
+not compatible with the former TransformerEncoder `model.v1` checkpoints. The
 conditioning ablations remove first-order private events or second-order target
-embeddings. All main configurations still optimize one masked 21-class
+embeddings. All configurations still optimize one masked 21-class
 cross-entropy objective.
 
 ## Data contract

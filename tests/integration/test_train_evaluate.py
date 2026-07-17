@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 import pytest
+import transformers
 
 from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
 from werewolf.prompt_protocol import (
@@ -39,7 +40,8 @@ def _write_dataset_run(tmp_path, records, run_id, *, audit_records=None):
     return samples_path
 
 
-def test_tiny_train_and_evaluate_smoke(tmp_path):
+@pytest.mark.parametrize("architecture", ["gpt2block", "gru", "boe_mlp"])
+def test_tiny_train_and_evaluate_smoke(tmp_path, architecture):
     first_order = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
     second_state = deepcopy(first_order)
     second_state["sample_id"] = "fixture:first:second-state"
@@ -62,7 +64,7 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
             "include_first_order_private": True,
         },
         "model": {
-            "architecture": "boe_mlp",
+            "architecture": architecture,
             "d_model": 8,
             "num_layers": 1,
             "num_heads": 2,
@@ -84,6 +86,29 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     report = train_from_config(train_config)
     assert report["history"][0]["valid"]["samples"] == 1
     checkpoint = torch.load(output_dir / "best.pt", map_location="cpu", weights_only=False)
+    assert checkpoint["schema_version"] == "model.v2"
+    assert checkpoint["architecture"] == architecture
+    assert checkpoint["config"]["model"]["architecture"] == architecture
+    assert checkpoint["transformers_version"] == transformers.__version__
+    if architecture == "gpt2block":
+        assert checkpoint["gpt2_config"] == {
+            "vocab_size": 1,
+            "n_positions": 16,
+            "n_ctx": 16,
+            "n_embd": 8,
+            "n_layer": 1,
+            "n_head": 2,
+            "n_inner": 32,
+            "resid_pdrop": 0.0,
+            "embd_pdrop": 0.0,
+            "attn_pdrop": 0.0,
+            "use_cache": False,
+            "add_cross_attention": False,
+            "bos_token_id": None,
+            "eos_token_id": None,
+        }
+    else:
+        assert checkpoint["gpt2_config"] is None
     assert checkpoint["pair_space"] == [list(pair) for pair in WOLF_PAIRS]
     assert checkpoint["event_encoder"] == {
         "schema_version": ENCODER_SCHEMA_VERSION,
@@ -123,6 +148,59 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     )
     assert set(evaluation["by_task"]) == {"first_order"}
     assert json.loads(evaluation_path.read_text(encoding="utf-8"))["overall"]
+
+    if architecture == "gpt2block":
+        model_v1 = deepcopy(checkpoint)
+        model_v1["schema_version"] = "model.v1"
+        model_v1_path = tmp_path / "model-v1.pt"
+        torch.save(model_v1, model_v1_path)
+        with pytest.raises(ValueError, match="unsupported checkpoint schema_version"):
+            evaluate_from_config(
+                {
+                    "schema_version": "evaluate.v1",
+                    "checkpoint": str(model_v1_path),
+                    "data_paths": [str(valid_path)],
+                    "batch_size": 2,
+                    "device": "cpu",
+                    "include_first_order_private": True,
+                    "output": str(tmp_path / "model-v1-evaluation.json"),
+                }
+            )
+
+        transformer_checkpoint = deepcopy(checkpoint)
+        transformer_checkpoint["architecture"] = "transformer"
+        transformer_checkpoint["config"]["model"]["architecture"] = "transformer"
+        transformer_path = tmp_path / "transformer.pt"
+        torch.save(transformer_checkpoint, transformer_path)
+        with pytest.raises(ValueError, match="checkpoint architecture"):
+            evaluate_from_config(
+                {
+                    "schema_version": "evaluate.v1",
+                    "checkpoint": str(transformer_path),
+                    "data_paths": [str(valid_path)],
+                    "batch_size": 2,
+                    "device": "cpu",
+                    "include_first_order_private": True,
+                    "output": str(tmp_path / "transformer-evaluation.json"),
+                }
+            )
+
+        partial_checkpoint = deepcopy(checkpoint)
+        partial_checkpoint["model_state"].pop(next(iter(partial_checkpoint["model_state"])))
+        partial_path = tmp_path / "partial.pt"
+        torch.save(partial_checkpoint, partial_path)
+        with pytest.raises(RuntimeError, match="Missing key"):
+            evaluate_from_config(
+                {
+                    "schema_version": "evaluate.v1",
+                    "checkpoint": str(partial_path),
+                    "data_paths": [str(valid_path)],
+                    "batch_size": 2,
+                    "device": "cpu",
+                    "include_first_order_private": True,
+                    "output": str(tmp_path / "partial-evaluation.json"),
+                }
+            )
 
     mismatched = deepcopy(first_order)
     mismatched["prompt_protocol"]["parser"]["sha256"] = "0" * 64
