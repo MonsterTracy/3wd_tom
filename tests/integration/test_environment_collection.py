@@ -60,6 +60,40 @@ TEST_PROMPT_PROTOCOL = build_prompt_protocol(
 )
 
 
+def _audit_report_with_parser_outcomes(*, calls, failures):
+    records = [
+        json.loads(line)
+        for line in FIXTURE.read_text(encoding="utf-8").splitlines()
+    ]
+    for index in range(calls):
+        status = "failed" if index < failures else "empty"
+        parser_result = {
+            "version": TEST_PROMPT_PROTOCOL["parser"]["version"],
+            "sha256": TEST_PROMPT_PROTOCOL["parser"]["sha256"],
+            "model": "fake-parser",
+            "temperature": 0.0,
+            "status": status,
+            "attempts": 1,
+            "error_code": "schema_validation_error" if status == "failed" else None,
+            "error": "fake schema validation failure" if status == "failed" else None,
+        }
+        speech = speech_event(
+            event_id=f"fixture.parser-rate.{index}",
+            utterance_id=f"fixture.parser-rate.{index}",
+            day=records[0]["day"],
+            phase=records[0]["phase"],
+            turn=min(record["turn"] for record in records),
+            speaker=3,
+            target=3,
+            value=None,
+            source_span="",
+            metadata={"parser_result": parser_result},
+        )
+        for record in records:
+            record["events"].append(deepcopy(speech))
+    return build_audit_report(records)
+
+
 class EmptyParserBackend:
     def chat(self, messages, **kwargs):
         return '{"events":[]}'
@@ -307,7 +341,8 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         "belief_invalid_format_failures", "belief_success_rate",
         "belief_repair_success_rate", "belief_success_constraint_violations",
         "speech_event_count", "parser_call_count", "parser_success_count",
-        "parser_empty_count", "parser_failure_count", "parser_repair_attempts",
+        "parser_empty_count", "parser_failure_count", "parser_failure_rate",
+        "parser_repair_attempts",
         "parsed_semantic_event_count", "speech_with_semantic_events",
         "speech_without_semantic_events", "parsed_event_family_distribution",
         "parser_failure_reason_distribution", "missing_parser_metadata_count",
@@ -378,6 +413,7 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["invalid_prompt_protocol_count"] == 0
     assert report["speech_event_count"] == 0
     assert report["parser_call_count"] == 0
+    assert report["parser_failure_rate"] is None
     assert assert_audit_passes(report)
 
     failed_report = build_audit_report(
@@ -505,19 +541,41 @@ def test_parser_audit_fails_missing_calls_zero_semantics_and_high_failure_rate()
     with pytest.raises(RuntimeError, match="parser_call_count|parser_metadata"):
         assert_audit_passes(report)
 
-    rate_report = build_audit_report(
-        [json.loads(line) for line in FIXTURE.read_text(encoding="utf-8").splitlines()]
-    )
-    rate_report.update(
-        speech_event_count=5,
-        parser_call_count=5,
-        parser_success_count=3,
-        parser_empty_count=0,
-        parser_failure_count=2,
-        parsed_semantic_event_count=3,
-    )
+    rate_report = _audit_report_with_parser_outcomes(calls=5, failures=2)
+    assert rate_report["parser_failure_rate"] == 0.4
     with pytest.raises(RuntimeError, match="parser_failure_rate"):
         assert_audit_passes(rate_report)
+
+
+def test_parser_failure_rate_uses_call_count_and_preserves_json_zero():
+    no_failures = _audit_report_with_parser_outcomes(calls=16, failures=0)
+    assert no_failures["parser_call_count"] == 16
+    assert no_failures["parser_failure_count"] == 0
+    assert no_failures["parser_failure_rate"] == 0.0
+    assert json.loads(json.dumps(no_failures))["parser_failure_rate"] == 0.0
+    assert assert_audit_passes(no_failures)
+
+    some_failures = _audit_report_with_parser_outcomes(calls=16, failures=3)
+    assert some_failures["parser_failure_rate"] == 0.1875
+    assert assert_audit_passes(some_failures)
+
+    at_limit = _audit_report_with_parser_outcomes(calls=5, failures=1)
+    assert at_limit["parser_failure_rate"] == 0.2
+    assert assert_audit_passes(at_limit)
+
+    no_calls = _audit_report_with_parser_outcomes(calls=0, failures=0)
+    assert no_calls["parser_failure_rate"] is None
+    assert assert_audit_passes(no_calls)
+
+    invalid_none = deepcopy(no_failures)
+    invalid_none["parser_failure_rate"] = None
+    with pytest.raises(RuntimeError, match="parser_failure_rate"):
+        assert_audit_passes(invalid_none)
+
+    invalid_zero = deepcopy(no_calls)
+    invalid_zero["parser_failure_rate"] = 0.0
+    with pytest.raises(RuntimeError, match="parser_failure_rate"):
+        assert_audit_passes(invalid_zero)
 
 
 def test_failed_guess_is_audited_and_fails_the_quality_gate():

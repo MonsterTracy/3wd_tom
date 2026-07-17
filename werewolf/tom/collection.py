@@ -581,6 +581,13 @@ def build_audit_report(
         completed_games = len(games) if collection_status == "complete" else 0
     if type(completed_games) is not int or not 0 <= completed_games <= len(games):
         raise ValueError("completed_games must be within the audited game count")
+    parser_call_count = len(valid_parser_metadata)
+    parser_failure_count = parser_statuses["failed"]
+    parser_failure_rate = (
+        parser_failure_count / parser_call_count
+        if parser_call_count > 0
+        else None
+    )
     return {
         "schema_version": "tom.audit.v1_4",
         "collection_status": collection_status,
@@ -612,10 +619,11 @@ def build_audit_report(
         "belief_success_rate": belief_success_rate,
         "belief_repair_success_rate": belief_repair_success_rate,
         "speech_event_count": len(speech_events),
-        "parser_call_count": len(valid_parser_metadata),
+        "parser_call_count": parser_call_count,
         "parser_success_count": parser_statuses["success"],
         "parser_empty_count": parser_statuses["empty"],
-        "parser_failure_count": parser_statuses["failed"],
+        "parser_failure_count": parser_failure_count,
+        "parser_failure_rate": parser_failure_rate,
         "parser_repair_attempts": parser_repair_attempts,
         "parsed_semantic_event_count": len(semantic_events),
         "speech_with_semantic_events": speech_with_semantic_events,
@@ -747,8 +755,20 @@ def assert_audit_passes(report):
     ):
         failures["parsed_semantic_event_count"] = 0
     parser_failure_count = report.get("parser_failure_count", 0)
-    if parser_calls and parser_failure_count / parser_calls > PARSER_FAILURE_RATE_LIMIT:
-        failures["parser_failure_rate"] = parser_failure_count / parser_calls
+    expected_parser_failure_rate = (
+        parser_failure_count / parser_calls if parser_calls > 0 else None
+    )
+    parser_failure_rate = report.get("parser_failure_rate")
+    if parser_failure_rate != expected_parser_failure_rate:
+        failures["parser_failure_rate"] = {
+            "actual": parser_failure_rate,
+            "expected": expected_parser_failure_rate,
+        }
+    elif (
+        parser_failure_rate is not None
+        and parser_failure_rate > PARSER_FAILURE_RATE_LIMIT
+    ):
+        failures["parser_failure_rate"] = parser_failure_rate
     if (
         report.get("unique_belief_elicitations", 0)
         and report.get("belief_success_rate", 0.0) < BELIEF_SUCCESS_RATE_MINIMUM

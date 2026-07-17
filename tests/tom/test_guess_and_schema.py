@@ -44,6 +44,7 @@ from werewolf.prompt_protocol import (
     gameplay_repair_message,
     render_gameplay_phase_task,
 )
+from werewolf.tom.collection import build_audit_report
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import sample_to_features
 from werewolf.tom.guess_provider import BeliefGuessProvider, SYSTEM_PROMPT
@@ -57,6 +58,26 @@ from werewolf.tom.schemas import (
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "tom_v1.jsonl"
+
+
+def _write_dataset_run(tmp_path, records, run_id, *, audit_records=None):
+    run_dir = tmp_path / run_id
+    run_dir.mkdir()
+    samples_path = run_dir / f"{run_id}.samples.jsonl"
+    samples_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    audited = records if audit_records is None else audit_records
+    audit = build_audit_report(
+        audited,
+        game_ids=sorted({record["game_id"] for record in audited}),
+    )
+    (run_dir / f"{run_id}.audit.json").write_text(
+        json.dumps(audit), encoding="utf-8"
+    )
+    (run_dir / f"{run_id}.failures.jsonl").touch()
+    return samples_path
 
 
 class SequenceBackend:
@@ -787,18 +808,39 @@ def test_guess_schema_distinguishes_backend_retry_from_semantic_repair():
 
 
 def test_dataset_accepts_only_successful_tom_v1(tmp_path):
-    dataset = ToMDataset(FIXTURE)
+    records = [
+        json.loads(line)
+        for line in FIXTURE.read_text(encoding="utf-8").splitlines()
+    ]
+    samples_path = _write_dataset_run(tmp_path, records, "game_001")
+    dataset = ToMDataset(samples_path)
     assert len(dataset) == 2
     assert dataset.protocol_id == dataset.records[0]["prompt_protocol"]["protocol_id"]
     assert dataset[0]["output_mask"].shape == (21,)
     assert "prompt_protocol" not in sample_to_features(dataset.records[0])
     assert "sample_id" not in sample_to_features(dataset.records[0])
-    legacy = tmp_path / "legacy.jsonl"
-    legacy.write_text(json.dumps({"schema_version": "legacy.v0"}) + "\n", encoding="utf-8")
+    legacy = _write_dataset_run(
+        tmp_path,
+        [{"schema_version": "legacy.v0"}],
+        "game_002",
+        audit_records=records,
+    )
     with pytest.raises(ValueError, match="legacy samples are rejected|fields"):
         ToMDataset(legacy)
     with pytest.raises(ValueError, match="duplicate sample_id"):
-        ToMDataset([FIXTURE, FIXTURE])
+        ToMDataset([samples_path, samples_path])
+
+    missing_dir = tmp_path / "game_003"
+    missing_dir.mkdir()
+    missing_samples = missing_dir / "game_003.samples.jsonl"
+    missing_samples.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    (missing_dir / "game_003.failures.jsonl").touch()
+    (missing_dir / "samples.audit.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing collection audit"):
+        ToMDataset(missing_samples)
 
 
 def test_tracking_ids_do_not_change_model_tensors_or_tokens():
@@ -915,8 +957,9 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
     old_english["prompt_protocol"]["protocol_version"] = "prompt_protocol.zh.v1"
     for name in ("gameplay", "belief", "parser"):
         old_english["prompt_protocol"][name]["version"] = f"{name}.zh.v1"
-    old_path = tmp_path / "old-english.jsonl"
-    old_path.write_text(json.dumps(old_english) + "\n", encoding="utf-8")
+    old_path = _write_dataset_run(
+        tmp_path, [old_english], "game_010", audit_records=[record]
+    )
     with pytest.raises(ValueError, match="unsupported prompt_protocol"):
         ToMDataset(old_path)
 
@@ -931,8 +974,9 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
         "version": "belief.zh.v2",
         "sha256": "926c54a36358f0d8848f0d7591000e152988420eea8b929880baa653881c6dab",
     }
-    old_v2_path = tmp_path / "old-v2.jsonl"
-    old_v2_path.write_text(json.dumps(old_v2) + "\n", encoding="utf-8")
+    old_v2_path = _write_dataset_run(
+        tmp_path, [old_v2], "game_011", audit_records=[record]
+    )
     with pytest.raises(ValueError, match="unsupported prompt_protocol"):
         ToMDataset(old_v2_path)
 
@@ -947,9 +991,11 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
         "version": "parser.zh.v2",
         "sha256": "8f796886879c3303feffa3ecf9915eeaf07ea6ce817433ba8a1734ea59ca84f7",
     }
-    old_parser_v2_path = tmp_path / "old-parser-v2.jsonl"
-    old_parser_v2_path.write_text(
-        json.dumps(old_parser_v2) + "\n", encoding="utf-8"
+    old_parser_v2_path = _write_dataset_run(
+        tmp_path,
+        [old_parser_v2],
+        "game_012",
+        audit_records=[record],
     )
     with pytest.raises(ValueError, match="unsupported prompt_protocol"):
         ToMDataset(old_parser_v2_path)
@@ -964,10 +1010,11 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
         for name in ("gameplay", "belief", "parser")
     }
     mixed["prompt_protocol"]["protocol_id"] = protocol_id_from_references(references)
-    mixed_path = tmp_path / "mixed.jsonl"
-    mixed_path.write_text(
-        json.dumps(record) + "\n" + json.dumps(mixed) + "\n",
-        encoding="utf-8",
+    mixed_path = _write_dataset_run(
+        tmp_path,
+        [record, mixed],
+        "game_013",
+        audit_records=[record],
     )
     with pytest.raises(ValueError, match="canonical prompt|one prompt protocol"):
         ToMDataset(mixed_path)

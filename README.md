@@ -88,7 +88,7 @@ contains only runtime choices such as backend, model, and gameplay temperature;
 canonical prompt text cannot be overridden from YAML. Legacy runtime YAML is
 rejected rather than normalized.
 
-Load the key into the shell and run a one-game pilot with:
+Load the key into the shell and collect exactly one game with:
 
 ```bash
 set -a
@@ -97,15 +97,19 @@ set +a
 python -m script.tom.collect \
   --config configs/tom/collect.yaml \
   --games 1 \
-  --output-dir data/tom/pilot_YYYYMMDD_001
+  --run-id game_001 \
+  --data-dir data \
+  --log-dir logs
 ```
 
-Every pilot must use a new `--output-dir`; the collect command creates it and
-refuses any path that already exists. Generated JSON/JSONL under `data/tom/` is
-ignored by Git. If gameplay or the audit fails, partial samples, failures, logs,
-and `samples.audit.json` remain in that directory for diagnosis. Such an audit
-has `collection_status="failed"`; its samples are not trainable, and the dataset
-loader rejects them. Do not reuse an old pilot directory.
+One command represents one game. Number runs sequentially from `game_001`; the
+same run ID creates `data/game_001/` for samples, failures, and audit, plus
+`logs/game_001/` for the game and seven player logs. The command refuses to run
+if either run directory already exists, so it never appends to or overwrites a
+previous game. A failed game keeps both directories and its partial artifacts
+for diagnosis, but its audit has `collection_status="failed"` and the Dataset
+loader rejects it for training. Start the retry with a new run ID rather than
+reusing an existing directory. The former dated pilot layout is no longer used.
 
 ## Ruleset and Prompt Protocol V5
 
@@ -163,7 +167,6 @@ Prompt-Agent protocol; evaluation rejects data from a different protocol.
 ## Commands
 
 ```bash
-python -m script.tom.collect --config configs/tom/collect.yaml
 python -m script.tom.train --config configs/tom/first_order.yaml
 python -m script.tom.eval --config configs/tom/evaluate.yaml
 ```

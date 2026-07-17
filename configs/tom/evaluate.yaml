@@ -1,6 +1,6 @@
 schema_version: evaluate.v1
 checkpoint: artifacts/tom/first_order/best.pt
-data_paths: [data/tom/test.jsonl]
+data_paths: [data/game_003/game_003.samples.jsonl]
 batch_size: 128
 device: auto
 include_first_order_private: true

@@ -1,7 +1,7 @@
 schema_version: train.v1
 data:
-  train_paths: [data/tom/train.jsonl]
-  valid_paths: [data/tom/valid.jsonl]
+  train_paths: [data/game_001/game_001.samples.jsonl]
+  valid_paths: [data/game_002/game_002.samples.jsonl]
   task: second_order
   mode: public_only
   include_first_order_private: true

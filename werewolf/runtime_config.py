@@ -1,12 +1,15 @@
 """Strict validation for the sole supported collection runtime schema."""
 
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
+import re
 
 from werewolf.game_rules import NUM_PLAYERS, NUM_WEREWOLVES, ROLE_DISTRIBUTIONS
 
 
 RUNTIME_SCHEMA_VERSION = "runtime.v1"
+RUN_ID_PATTERN = re.compile(r"^game_[0-9]{3,}$")
 BACKEND_FIELDS = {"type", "base_url", "api_key_env", "default_model"}
 PROFILE_FIELDS = {"agent_type", "backend", "model", "temperature", "strategy"}
 TOP_LEVEL_FIELDS = {
@@ -21,6 +24,25 @@ TOP_LEVEL_FIELDS = {
     "environment",
     "output",
 }
+
+
+@dataclass(frozen=True)
+class RunPaths:
+    run_id: str
+    data_root: Path
+    log_root: Path
+    data_run_dir: Path
+    log_run_dir: Path
+    samples_path: Path
+    audit_path: Path
+    failures_path: Path
+    game_log_path: Path
+    parser_failures_path: Path
+
+    def player_log_path(self, player_id):
+        if type(player_id) is not int or not 1 <= player_id <= NUM_PLAYERS:
+            raise ValueError(f"player_id must be between 1 and {NUM_PLAYERS}")
+        return self.log_run_dir / f"{self.run_id}.player_{player_id}.jsonl"
 
 
 def _mapping(value, name):
@@ -144,35 +166,52 @@ def resolve_guess_config(config, profile):
     return deepcopy(guess)
 
 
-def resolve_collection_output(config, output_dir=None):
-    """Resolve the sole collection output layout without changing the schema."""
+def validate_run_id(run_id):
+    if not isinstance(run_id, str) or RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise ValueError("run_id must match ^game_[0-9]{3,}$")
+    return run_id
+
+
+def _collection_root(path, name):
+    if not isinstance(path, (str, Path)) or not str(path).strip():
+        raise ValueError(f"{name} must be a non-empty path")
+    return Path(path).expanduser().resolve()
+
+
+def resolve_collection_output(
+    config, *, run_id, data_dir="data", log_dir="logs"
+):
+    """Resolve the sole one-run/one-game collection layout."""
 
     resolved = normalize_runtime_config(config)
-    if output_dir is None:
-        samples = Path(resolved["output"]["samples"])
-        return resolved, {
-            "output_dir": samples.parent.resolve(),
-            "samples": samples,
-            "failures": Path(resolved["output"]["failures"]),
-            "audit": samples.with_suffix(".audit.json"),
-            "logs": Path(resolved["output"]["logs"]),
-        }
-    if not isinstance(output_dir, (str, Path)) or not str(output_dir).strip():
-        raise ValueError("output-dir must be a non-empty path")
-    directory = Path(output_dir).expanduser().resolve()
+    run_id = validate_run_id(run_id)
+    data_root = _collection_root(data_dir, "data-dir")
+    log_root = _collection_root(log_dir, "log-dir")
+    if data_root == log_root:
+        raise ValueError("data-dir and log-dir must be different directories")
+    data_run_dir = data_root / run_id
+    log_run_dir = log_root / run_id
+    paths = RunPaths(
+        run_id=run_id,
+        data_root=data_root,
+        log_root=log_root,
+        data_run_dir=data_run_dir,
+        log_run_dir=log_run_dir,
+        samples_path=data_run_dir / f"{run_id}.samples.jsonl",
+        audit_path=data_run_dir / f"{run_id}.audit.json",
+        failures_path=data_run_dir / f"{run_id}.failures.jsonl",
+        game_log_path=log_run_dir / f"{run_id}.game_log.json",
+        parser_failures_path=(
+            log_run_dir / f"{run_id}.parser_failures.json"
+        ),
+    )
     resolved["output"] = {
-        "samples": str(directory / "samples.jsonl"),
-        "failures": str(directory / "failures.jsonl"),
-        "logs": str(directory / "logs"),
+        "samples": str(paths.samples_path),
+        "failures": str(paths.failures_path),
+        "logs": str(paths.log_run_dir),
         "overwrite": False,
     }
-    return resolved, {
-        "output_dir": directory,
-        "samples": directory / "samples.jsonl",
-        "failures": directory / "failures.jsonl",
-        "audit": directory / "samples.audit.json",
-        "logs": directory / "logs",
-    }
+    return resolved, paths
 
 
 def build_prompt_runtime_metadata(config):

@@ -36,7 +36,7 @@ environment:
   werewolf_reward: 1
   village_reward: 1
 output:
-  samples: data/tom/samples.jsonl
-  failures: data/tom/failures.jsonl
-  logs: logs/tom
+  samples: data/game_001/game_001.samples.jsonl
+  failures: data/game_001/game_001.failures.jsonl
+  logs: logs/game_001
   overwrite: false

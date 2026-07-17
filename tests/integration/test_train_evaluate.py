@@ -10,6 +10,7 @@ from werewolf.prompt_protocol import (
     checkpoint_prompt_metadata,
     protocol_id_from_references,
 )
+from werewolf.tom.collection import build_audit_report
 from werewolf.tom.evaluation import evaluate_from_config
 from werewolf.tom.pair_space import WOLF_PAIRS
 from werewolf.tom.training import train_from_config
@@ -18,21 +19,38 @@ from werewolf.tom.training import train_from_config
 FIXTURE = Path("tests/fixtures/tom_v1.jsonl")
 
 
+def _write_dataset_run(tmp_path, records, run_id, *, audit_records=None):
+    run_dir = tmp_path / run_id
+    run_dir.mkdir()
+    samples_path = run_dir / f"{run_id}.samples.jsonl"
+    samples_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    audited = records if audit_records is None else audit_records
+    audit = build_audit_report(
+        audited,
+        game_ids=sorted({record["game_id"] for record in audited}),
+    )
+    (run_dir / f"{run_id}.audit.json").write_text(
+        json.dumps(audit), encoding="utf-8"
+    )
+    (run_dir / f"{run_id}.failures.jsonl").touch()
+    return samples_path
+
+
 def test_tiny_train_and_evaluate_smoke(tmp_path):
     first_order = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
     second_state = deepcopy(first_order)
     second_state["sample_id"] = "fixture:first:second-state"
     second_state["state_id"] = "fixture:e5"
     second_state["public_state_id"] = "fixture:e5"
-    train_path = tmp_path / "train.jsonl"
-    valid_path = tmp_path / "valid.jsonl"
     valid_record = deepcopy(first_order)
     valid_record["game_id"] = "fixture-valid"
-    train_path.write_text(
-        "\n".join(json.dumps(record) for record in (first_order, second_state)) + "\n",
-        encoding="utf-8",
+    train_path = _write_dataset_run(
+        tmp_path, [first_order, second_state], "game_001"
     )
-    valid_path.write_text(json.dumps(valid_record) + "\n", encoding="utf-8")
+    valid_path = _write_dataset_run(tmp_path, [valid_record], "game_002")
     output_dir = tmp_path / "run"
     train_config = {
         "schema_version": "train.v1",
@@ -115,8 +133,12 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     mismatched["prompt_protocol"]["protocol_id"] = protocol_id_from_references(
         references
     )
-    mismatched_path = tmp_path / "mismatched.jsonl"
-    mismatched_path.write_text(json.dumps(mismatched) + "\n", encoding="utf-8")
+    mismatched_path = _write_dataset_run(
+        tmp_path,
+        [mismatched],
+        "game_003",
+        audit_records=[first_order],
+    )
     with pytest.raises(ValueError, match="prompt.protocol|canonical prompt"):
         evaluate_from_config(
             {
@@ -150,10 +172,8 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
 
 def test_training_rejects_a_game_split_across_train_and_validation(tmp_path):
     record = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
-    train_path = tmp_path / "train.jsonl"
-    valid_path = tmp_path / "valid.jsonl"
-    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    valid_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    train_path = _write_dataset_run(tmp_path, [record], "game_001")
+    valid_path = _write_dataset_run(tmp_path, [record], "game_002")
     config = {
         "schema_version": "train.v1",
         "data": {

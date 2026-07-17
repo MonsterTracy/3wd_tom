@@ -605,34 +605,77 @@ def test_parser_v3_prompt_defines_qualifiers_evidence_certainty_and_actions():
     assert "evidence_source=inference" in prompt
 
 
-def test_pilot_003_first_parser_responses_recover_all_events_offline():
-    root = Path("data/tom/pilot_20260717_003")
-    failures = json.loads(
-        (root / "logs/game_20260716/parser_failures.json").read_text(
-            encoding="utf-8"
-        )
+def test_parser_v3_offline_payload_fixture_recovers_all_events(tmp_path):
+    family_plans = (
+        (3, 2, 1),
+        (3, 2, 1),
+        (3, 2, 1),
+        (2, 2, 2),
+        (2, 2, 1),
+        (1, 2, 2),
     )
-    wanted = {record["utterance_id"] for record in failures}
-    utterances = {}
-    with (root / "samples.jsonl").open(encoding="utf-8") as source:
-        for line in source:
-            if not line.strip():
-                continue
-            sample = json.loads(line)
-            for event in sample["events"]:
-                utterance_id = event.get("utterance_id")
-                if (
-                    utterance_id in wanted
-                    and event.get("content", {}).get("kind") == "SPEECH"
-                ):
-                    utterances.setdefault(utterance_id, event["source_span"])
-
+    fixture_records = []
+    event_index = 0
+    for record_index, (beliefs, stances, actions) in enumerate(
+        family_plans, start=1
+    ):
+        payload_events = []
+        source_spans = []
+        for family, count in (
+            ("BELIEF_ASSERTION", beliefs),
+            ("SOCIAL_STANCE", stances),
+            ("ACTION_POSITION", actions),
+        ):
+            for _ in range(count):
+                event_index += 1
+                player_id = event_index % 7 + 1
+                source_span = f"片段{event_index}"
+                source_spans.append(source_span)
+                if family == "BELIEF_ASSERTION":
+                    content = {"kind": "ROLE", "value": "Werewolf"}
+                    qualifier = {
+                        "certainty": "normal",
+                        "evidence_source": "unspecified",
+                    }
+                elif family == "SOCIAL_STANCE":
+                    content = {"kind": "STANCE", "value": None}
+                    qualifier = {"polarity": "negative", "strength": "normal"}
+                else:
+                    content = {"kind": "ACTION", "value": "VOTE"}
+                    qualifier = {"commitment": "consider"}
+                payload_events.append(
+                    {
+                        "event_family": family,
+                        "target": [player_id],
+                        "content": content,
+                        "qualifier": qualifier,
+                        "ref_event_id": None,
+                        "source_span": source_span,
+                        "parser_confidence": 1.0,
+                    }
+                )
+        fixture_records.append(
+            {
+                "utterance_id": f"fixture.u{record_index:05d}",
+                "utterance": "，".join(source_spans),
+                "raw_text": [
+                    json.dumps(
+                        {"events": payload_events}, ensure_ascii=False
+                    )
+                ],
+            }
+        )
+    fixture_path = tmp_path / "parser_v3_offline_recovery.json"
+    fixture_path.write_text(
+        json.dumps(fixture_records, ensure_ascii=False), encoding="utf-8"
+    )
+    failures = json.loads(fixture_path.read_text(encoding="utf-8"))
     recovered = []
     for record in failures:
         utterance_id = record["utterance_id"]
         events = _parse_payload(
             record["raw_text"][0],
-            utterance=utterances[utterance_id],
+            utterance=record["utterance"],
             utterance_id=utterance_id,
             day=1,
             phase="1_day_speech",
@@ -651,7 +694,6 @@ def test_pilot_003_first_parser_responses_recover_all_events_offline():
         recovered.extend(events)
 
     assert len(failures) == 6
-    assert len(utterances) == 6
     assert len(recovered) == 34
     assert Counter(event["event_family"] for event in recovered) == {
         "ACTION_POSITION": 8,
@@ -659,5 +701,11 @@ def test_pilot_003_first_parser_responses_recover_all_events_offline():
         "SOCIAL_STANCE": 12,
     }
     for event in recovered:
+        source_record = next(
+            record
+            for record in failures
+            if record["utterance_id"] == event["utterance_id"]
+        )
+        assert event["source_span"] in source_record["utterance"]
         for field, allowed in QUALIFIER_ENUMS.items():
             assert event["qualifier"][field] in allowed

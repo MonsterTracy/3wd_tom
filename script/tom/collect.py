@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import shutil
 import tempfile
 from copy import deepcopy
 from pathlib import Path
@@ -11,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from werewolf.backends import BackendError, load_named_backends
+from werewolf.game_rules import NUM_PLAYERS
 from werewolf.runtime import build_collection_runtime, rollout, shuffled_roles
 from werewolf.runtime_config import (
     resolve_collection_output,
@@ -27,26 +27,68 @@ def _writable_ancestor(path):
     return candidate
 
 
-def _validate_new_output_directory(path):
-    path = Path(path)
-    if path.exists():
-        if path.is_file():
-            raise NotADirectoryError(f"output-dir is a file: {path}")
-        raise FileExistsError(
-            f"output-dir already exists; choose a new directory: {path}"
-        )
-    ancestor = _writable_ancestor(path.parent)
-    if not os.access(ancestor, os.W_OK):
-        raise PermissionError(
-            f"output-dir parent is not writable via {ancestor}: {path.parent}"
-        )
+def _validate_new_run_directories(paths):
+    for root, name in (
+        (paths.data_root, "data-dir"),
+        (paths.log_root, "log-dir"),
+    ):
+        if root.exists() and not root.is_dir():
+            raise NotADirectoryError(f"{name} is not a directory: {root}")
+    conflicts = [
+        path
+        for path in (paths.data_run_dir, paths.log_run_dir)
+        if path.exists()
+    ]
+    if conflicts:
+        rendered = ", ".join(str(path) for path in conflicts)
+        raise FileExistsError(f"run directory already exists: {rendered}")
+    for run_dir in (paths.data_run_dir, paths.log_run_dir):
+        ancestor = _writable_ancestor(run_dir.parent)
+        if not os.access(ancestor, os.W_OK):
+            raise PermissionError(
+                f"run directory parent is not writable via {ancestor}: "
+                f"{run_dir.parent}"
+            )
 
 
-def _create_output_directory(path):
+def _create_run_directories(paths):
+    roots = tuple(dict.fromkeys((paths.data_root, paths.log_root)))
     try:
-        Path(path).mkdir(parents=True, exist_ok=False)
+        for root in roots:
+            root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise OSError(f"failed to create output-dir {path}: {exc}") from exc
+        raise OSError(f"failed to create collection roots: {exc}") from exc
+    created = []
+    try:
+        for run_dir in (paths.data_run_dir, paths.log_run_dir):
+            run_dir.mkdir(exist_ok=False)
+            created.append(run_dir)
+    except OSError as exc:
+        for run_dir in reversed(created):
+            run_dir.rmdir()
+        raise OSError(f"failed to create run directories: {exc}") from exc
+
+
+def _write_json(path, value):
+    with Path(path).open("w", encoding="utf-8") as output:
+        json.dump(value, output, ensure_ascii=False, indent=2)
+        output.write("\n")
+
+
+def _initialize_run_files(paths):
+    paths.samples_path.touch(exist_ok=False)
+    paths.failures_path.touch(exist_ok=False)
+    _write_json(paths.game_log_path, [])
+    for player_id in range(1, NUM_PLAYERS + 1):
+        paths.player_log_path(player_id).touch(exist_ok=False)
+
+
+def _write_runtime_logs(paths, environment):
+    events = [] if environment is None else environment.events
+    _write_json(paths.game_log_path, events)
+    parser_failures = [] if environment is None else environment.parser_failures
+    if parser_failures:
+        _write_json(paths.parser_failures_path, parser_failures)
 
 
 def _write_audit_atomically(path, audit):
@@ -142,89 +184,86 @@ def _safe_runtime_error(exc):
 
 
 def collect_from_config(
-    config, *, games=None, output_dir=None, backends=None, env=None
+    config,
+    *,
+    run_id,
+    games=None,
+    data_dir="data",
+    log_dir="logs",
+    backends=None,
+    env=None,
 ):
     config = deepcopy(config)
     if games is not None:
-        if games < 1:
-            raise ValueError("games must be positive")
         config["games"] = games
-    config, output_paths = resolve_collection_output(config, output_dir)
-    if output_dir is not None:
-        _validate_new_output_directory(output_paths["output_dir"])
+    if config.get("games") != 1:
+        raise ValueError(
+            "one run_id represents exactly one game; use --games 1"
+        )
+    config, run_paths = resolve_collection_output(
+        config,
+        run_id=run_id,
+        data_dir=data_dir,
+        log_dir=log_dir,
+    )
+    _validate_new_run_directories(run_paths)
     preflight = preflight_collection(config, env=env)
-    if output_dir is not None:
-        _create_output_directory(output_paths["output_dir"])
-    samples_path = output_paths["samples"]
-    audit_path = output_paths["audit"]
-    output_files = [
-        samples_path,
-        output_paths["failures"],
-        audit_path,
-    ]
-    for path in output_files:
-        if path.exists() and not config["output"]["overwrite"]:
-            raise FileExistsError(f"refusing to append to existing output: {path}")
-        if path.exists():
-            path.unlink()
-    backends = backends or load_named_backends(config)
-    results = []
-    for game_index in range(config["games"]):
-        game_config = deepcopy(config)
-        game_config["seed"] = config["seed"] + game_index
-        game_id = f"game_{game_config['seed']:06d}"
-        log_directory = Path(game_config["output"]["logs"]) / game_id
-        if log_directory.exists() and not game_config["output"]["overwrite"]:
-            raise FileExistsError(
-                f"refusing to append to existing game logs: {log_directory}"
-            )
-        if log_directory.exists():
-            shutil.rmtree(log_directory)
-        roles = shuffled_roles(game_config["environment"], game_config["seed"])
-        try:
-            environment, agents = build_collection_runtime(
-                game_config,
-                game_id=game_id,
-                roles=roles,
-                backends=backends,
-            )
-            result = rollout(
-                environment,
-                agents,
-                roles,
-                max_steps=game_config["max_steps"],
-            )
-        except Exception as exc:
-            samples = _read_jsonl(samples_path)
-            failures = _read_jsonl(config["output"]["failures"])
-            error_type, error_message = _safe_runtime_error(exc)
-            audit = build_audit_report(
-                samples,
-                failures,
-                game_ids=[item["game_id"] for item in results] + [game_id],
-                collection_status="failed",
-                completed_games=len(results),
-                failed_game_id=game_id,
-                runtime_error_type=error_type,
-                runtime_error_message=error_message,
-            )
-            _write_audit_atomically(audit_path, audit)
-            raise
-        results.append({"game_id": game_id, "roles": roles, **result})
-    samples = _read_jsonl(samples_path)
-    failures = _read_jsonl(config["output"]["failures"])
+    _create_run_directories(run_paths)
+    _initialize_run_files(run_paths)
+    environment = None
+    try:
+        backends = backends or load_named_backends(config)
+        roles = shuffled_roles(config["environment"], config["seed"])
+        environment, agents = build_collection_runtime(
+            config,
+            game_id=run_id,
+            roles=roles,
+            backends=backends,
+        )
+        game_result = rollout(
+            environment,
+            agents,
+            roles,
+            max_steps=config["max_steps"],
+        )
+    except Exception as exc:
+        _write_runtime_logs(run_paths, environment)
+        samples = _read_jsonl(run_paths.samples_path)
+        failures = _read_jsonl(run_paths.failures_path)
+        error_type, error_message = _safe_runtime_error(exc)
+        audit = build_audit_report(
+            samples,
+            failures,
+            game_ids=[run_id],
+            collection_status="failed",
+            completed_games=0,
+            failed_game_id=run_id,
+            runtime_error_type=error_type,
+            runtime_error_message=error_message,
+        )
+        _write_audit_atomically(run_paths.audit_path, audit)
+        raise
+    _write_runtime_logs(run_paths, environment)
+    results = [{"game_id": run_id, "roles": roles, **game_result}]
+    samples = _read_jsonl(run_paths.samples_path)
+    failures = _read_jsonl(run_paths.failures_path)
     audit = build_audit_report(
         samples,
         failures,
-        game_ids=[result["game_id"] for result in results],
+        game_ids=[run_id],
     )
-    _write_audit_atomically(audit_path, audit)
+    _write_audit_atomically(run_paths.audit_path, audit)
     assert_audit_passes(audit)
     return {
         "games": results,
         "preflight": preflight,
-        "output_dir": str(output_paths["output_dir"]),
-        "audit_path": str(audit_path),
+        "run_id": run_id,
+        "data_run_dir": str(run_paths.data_run_dir),
+        "log_run_dir": str(run_paths.log_run_dir),
+        "samples_path": str(run_paths.samples_path),
+        "failures_path": str(run_paths.failures_path),
+        "audit_path": str(run_paths.audit_path),
+        "game_log_path": str(run_paths.game_log_path),
         "audit": audit,
     }
 
@@ -233,19 +272,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/tom/collect.yaml")
     parser.add_argument("--games", type=int)
-    parser.add_argument("--output-dir")
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--log-dir", default="logs")
     args = parser.parse_args()
     with Path(args.config).open("r", encoding="utf-8") as source:
         config = yaml.safe_load(source)
     result = collect_from_config(
-        config, games=args.games, output_dir=args.output_dir
+        config,
+        games=args.games,
+        run_id=args.run_id,
+        data_dir=args.data_dir,
+        log_dir=args.log_dir,
     )
     audit = result["audit"]
     print(
         json.dumps(
             {
                 "games": len(result["games"]),
-                "output_dir": result["output_dir"],
+                "run_id": result["run_id"],
+                "data_run_dir": result["data_run_dir"],
+                "log_run_dir": result["log_run_dir"],
+                "samples_path": result["samples_path"],
                 "audit_path": result["audit_path"],
                 "unique_belief_elicitations": audit["unique_belief_elicitations"],
                 "successful_guesses": audit["successful_guesses"],

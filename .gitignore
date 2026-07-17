@@ -22,9 +22,8 @@ htmlcov/
 .codegraph/
 
 # Generated data, logs, checkpoints, and reports
-data/tom/**/*.jsonl
-data/tom/**/*.json
-logs/
+data/game_*/
+logs/game_*/
 artifacts/
 checkpoints/
 runs/

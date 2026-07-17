@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
+from werewolf.tom.collection import build_audit_report
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import collate_features
 from werewolf.tom.losses import masked_pair_cross_entropy
@@ -8,9 +12,31 @@ from werewolf.tom.metrics import compute_metrics, pair_probabilities, player_mar
 from werewolf.tom.model import ToMModel, ToMModelConfig
 
 
+def _dataset_path(tmp_path):
+    records = [
+        json.loads(line)
+        for line in Path("tests/fixtures/tom_v1.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    run_dir = tmp_path / "game_001"
+    run_dir.mkdir()
+    samples_path = run_dir / "game_001.samples.jsonl"
+    samples_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    audit = build_audit_report(records, game_ids=["fixture"])
+    (run_dir / "game_001.audit.json").write_text(
+        json.dumps(audit), encoding="utf-8"
+    )
+    (run_dir / "game_001.failures.jsonl").touch()
+    return samples_path
+
+
 @pytest.mark.parametrize("architecture", ["boe_mlp", "gru", "transformer"])
-def test_all_formal_backbones_emit_21_masked_logits(architecture):
-    dataset = ToMDataset("tests/fixtures/tom_v1.jsonl")
+def test_all_formal_backbones_emit_21_masked_logits(architecture, tmp_path):
+    dataset = ToMDataset(_dataset_path(tmp_path))
     batch = collate_features([dataset[0], dataset[1]])
     model = ToMModel(
         ToMModelConfig(

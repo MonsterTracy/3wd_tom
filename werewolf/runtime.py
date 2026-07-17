@@ -29,7 +29,7 @@ def shuffled_roles(environment_config, seed):
     return roles
 
 
-def build_agents(config, *, roles, backends, log_directory):
+def build_agents(config, *, game_id, roles, backends, log_directory):
     profiles = config["agents"]["profiles"]
     agents = []
     for player_id, role in enumerate(roles, start=1):
@@ -43,7 +43,9 @@ def build_agents(config, *, roles, backends, log_directory):
             "backend": resolve_backend(profile["backend"], backends),
             "model_name": profile["model"],
             "temperature": profile["temperature"],
-            "log_file": str(Path(log_directory) / f"player_{player_id}.jsonl"),
+            "log_file": str(
+                Path(log_directory) / f"{game_id}.player_{player_id}.jsonl"
+            ),
         }
         if profile["agent_type"] == "twdm_agent":
             kwargs["twdm_config"] = profile["strategy"]
@@ -54,9 +56,10 @@ def build_agents(config, *, roles, backends, log_directory):
 def build_collection_runtime(config, *, game_id, roles, backends=None):
     validate_runtime_config(config)
     backends = backends or load_named_backends(config)
-    log_directory = Path(config["output"]["logs"]) / game_id
+    log_directory = Path(config["output"]["logs"])
     agents = build_agents(
         config,
+        game_id=game_id,
         roles=roles,
         backends=backends,
         log_directory=log_directory,
@@ -91,7 +94,7 @@ def build_collection_runtime(config, *, game_id, roles, backends=None):
     environment_kwargs = dict(config["environment"])
     environment_kwargs.update(
         random_seed=config["seed"],
-        log_save_path=log_directory,
+        log_save_path=None,
         speech_parser=parser,
         tom_collector=collector,
     )

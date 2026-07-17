@@ -276,83 +276,102 @@ def test_collection_preflight_resolves_guess_inheritance_and_override_without_ne
     assert overridden_result["backend_names"] == ["deepseek"]
 
 
-def test_output_dir_overrides_all_configured_paths_and_default_keeps_config(tmp_path):
+@pytest.mark.parametrize("run_id", ["game_001", "game_010", "game_1000"])
+def test_run_id_resolves_canonical_data_and_log_paths(tmp_path, run_id):
     config = _config()
-    unchanged, default_paths = resolve_collection_output(config)
-    assert unchanged == config
-    assert default_paths["samples"] == Path(config["output"]["samples"])
-    assert default_paths["failures"] == Path(config["output"]["failures"])
-    assert default_paths["logs"] == Path(config["output"]["logs"])
-
-    pilot_dir = tmp_path / "pilot_001"
-    overridden, paths = resolve_collection_output(config, pilot_dir)
-    assert paths == {
-        "output_dir": pilot_dir.resolve(),
-        "samples": pilot_dir.resolve() / "samples.jsonl",
-        "failures": pilot_dir.resolve() / "failures.jsonl",
-        "audit": pilot_dir.resolve() / "samples.audit.json",
-        "logs": pilot_dir.resolve() / "logs",
-    }
-    assert overridden["output"] == {
-        "samples": str(paths["samples"]),
-        "failures": str(paths["failures"]),
-        "logs": str(paths["logs"]),
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
+    resolved, paths = resolve_collection_output(
+        config, run_id=run_id, data_dir=data_root, log_dir=log_root
+    )
+    assert paths.data_run_dir == data_root.resolve() / run_id
+    assert paths.log_run_dir == log_root.resolve() / run_id
+    assert paths.samples_path == paths.data_run_dir / f"{run_id}.samples.jsonl"
+    assert paths.audit_path == paths.data_run_dir / f"{run_id}.audit.json"
+    assert paths.failures_path == paths.data_run_dir / f"{run_id}.failures.jsonl"
+    assert paths.game_log_path == paths.log_run_dir / f"{run_id}.game_log.json"
+    assert [paths.player_log_path(player_id) for player_id in range(1, 8)] == [
+        paths.log_run_dir / f"{run_id}.player_{player_id}.jsonl"
+        for player_id in range(1, 8)
+    ]
+    assert resolved["output"] == {
+        "samples": str(paths.samples_path),
+        "failures": str(paths.failures_path),
+        "logs": str(paths.log_run_dir),
         "overwrite": False,
     }
     assert config == _config()
 
 
-def test_output_dir_safety_rejects_blank_file_and_existing_dir_before_backend(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "run_id", ["game_1", "pilot_001", "001", "../game_001", "game_001/test"]
+)
+def test_invalid_run_id_is_rejected(run_id):
+    config = _config()
+    with pytest.raises(ValueError, match="run_id must match"):
+        resolve_collection_output(config, run_id=run_id)
+
+
+@pytest.mark.parametrize("conflict", ["data", "logs", "both"])
+def test_run_directory_conflicts_fail_before_backend_or_partial_creation(
+    tmp_path, monkeypatch, conflict
 ):
     config = _config()
-    loaded = []
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
+    data_run_dir = data_root / "game_001"
+    log_run_dir = log_root / "game_001"
+    if conflict in {"data", "both"}:
+        data_run_dir.mkdir(parents=True)
+    if conflict in {"logs", "both"}:
+        log_run_dir.mkdir(parents=True)
+    loaded = 0
 
     def unexpected_backend_load(_config):
-        loaded.append(True)
+        nonlocal loaded
+        loaded += 1
         raise AssertionError("backend construction must not start")
 
     monkeypatch.setattr(collect_module, "load_named_backends", unexpected_backend_load)
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(FileExistsError, match="run directory already exists") as error:
         collect_from_config(
-            config, output_dir="", env={"DEEPSEEK_API_KEY": "fake"}
-        )
-
-    output_file = tmp_path / "pilot-file"
-    output_file.write_text("occupied", encoding="utf-8")
-    with pytest.raises(NotADirectoryError, match="is a file"):
-        collect_from_config(
-            config, output_dir=output_file,
+            config,
+            run_id="game_001",
+            data_dir=data_root,
+            log_dir=log_root,
             env={"DEEPSEEK_API_KEY": "fake"},
         )
+    assert loaded == 0
+    expected_conflicts = {
+        "data": [data_run_dir],
+        "logs": [log_run_dir],
+        "both": [data_run_dir, log_run_dir],
+    }[conflict]
+    assert all(str(path) in str(error.value) for path in expected_conflicts)
+    if conflict == "data":
+        assert not log_root.exists()
+    if conflict == "logs":
+        assert not data_root.exists()
 
-    existing_dir = tmp_path / "pilot-existing"
-    existing_dir.mkdir()
-    (existing_dir / "samples.jsonl").write_text("occupied", encoding="utf-8")
-    with pytest.raises(FileExistsError, match="already exists"):
-        collect_from_config(
-            config, output_dir=existing_dir,
-            env={"DEEPSEEK_API_KEY": "fake"},
-        )
-    assert loaded == []
 
-
-def test_configured_existing_sample_is_rejected_before_backend(tmp_path, monkeypatch):
+def test_games_other_than_one_fail_before_backend(tmp_path, monkeypatch):
     config = _config()
-    config["output"] = {
-        "samples": str(tmp_path / "samples.jsonl"),
-        "failures": str(tmp_path / "failures.jsonl"),
-        "logs": str(tmp_path / "logs"),
-        "overwrite": False,
-    }
-    Path(config["output"]["samples"]).write_text("occupied", encoding="utf-8")
     monkeypatch.setattr(
         collect_module,
         "load_named_backends",
         lambda _config: pytest.fail("backend construction must not start"),
     )
-    with pytest.raises(FileExistsError, match="samples.jsonl"):
-        collect_from_config(config, env={"DEEPSEEK_API_KEY": "fake"})
+    with pytest.raises(ValueError, match="one run_id represents exactly one game"):
+        collect_from_config(
+            config,
+            run_id="game_001",
+            games=2,
+            data_dir=tmp_path / "data",
+            log_dir=tmp_path / "logs",
+            env={"DEEPSEEK_API_KEY": "fake"},
+        )
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "logs").exists()
 
 
 class DeterministicFakeBackend:
@@ -432,28 +451,42 @@ class InvalidGameplayFakeBackend(DeterministicFakeBackend):
 def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_path):
     config = _config()
     config["seed"] = 19
-    config["output"] = {
-        "samples": str(tmp_path / "configured" / "samples.jsonl"),
-        "failures": str(tmp_path / "configured" / "failures.jsonl"),
-        "logs": str(tmp_path / "configured-logs"),
-        "overwrite": False,
-    }
-    output_dir = tmp_path / "pilot_001"
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
     result = collect_from_config(
         config,
         games=1,
-        output_dir=output_dir,
+        run_id="game_001",
+        data_dir=data_root,
+        log_dir=log_root,
         backends={"deepseek": DeterministicFakeBackend()},
         env={"DEEPSEEK_API_KEY": "fake-for-test"},
     )
 
     audit = result["audit"]
-    assert result["output_dir"] == str(output_dir.resolve())
-    assert Path(result["audit_path"]) == output_dir / "samples.audit.json"
-    assert {
-        "samples.jsonl", "failures.jsonl", "samples.audit.json", "logs"
-    } <= {path.name for path in output_dir.iterdir()}
-    assert not list(output_dir.glob(".samples.audit.json.*.tmp"))
+    data_run_dir = data_root / "game_001"
+    log_run_dir = log_root / "game_001"
+    samples_path = data_run_dir / "game_001.samples.jsonl"
+    failures_path = data_run_dir / "game_001.failures.jsonl"
+    audit_path = data_run_dir / "game_001.audit.json"
+    assert result["run_id"] == "game_001"
+    assert Path(result["data_run_dir"]) == data_run_dir
+    assert Path(result["log_run_dir"]) == log_run_dir
+    assert Path(result["samples_path"]) == samples_path
+    assert Path(result["audit_path"]) == audit_path
+    assert {path.name for path in data_run_dir.iterdir()} == {
+        "game_001.samples.jsonl",
+        "game_001.failures.jsonl",
+        "game_001.audit.json",
+    }
+    assert {path.name for path in log_run_dir.iterdir()} == {
+        "game_001.game_log.json",
+        *(f"game_001.player_{player_id}.jsonl" for player_id in range(1, 8)),
+    }
+    assert not any(path.is_dir() for path in data_run_dir.iterdir())
+    assert not any(path.is_dir() for path in log_run_dir.iterdir())
+    assert not (data_root / "tom").exists()
+    assert not list(data_run_dir.glob(".game_001.audit.json.*.tmp"))
     assert len(result["games"]) == 1
     assert result["games"][0]["winner"] in {"Werewolf", "Village"}
     assert audit["schema_version"] == "tom.audit.v1_4"
@@ -496,6 +529,7 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert audit["parser_success_count"] > 0
     assert audit["parser_empty_count"] == 1
     assert audit["parser_failure_count"] == 0
+    assert audit["parser_failure_rate"] == 0.0
     assert audit["parsed_semantic_event_count"] > 0
     assert audit["speech_with_semantic_events"] > 0
     assert audit["speech_without_semantic_events"] == 1
@@ -503,9 +537,7 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert audit["parser_utterance_mismatch_count"] == 0
     samples = [
         json.loads(line)
-        for line in (output_dir / "samples.jsonl").read_text(
-            encoding="utf-8"
-        ).splitlines()
+        for line in samples_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     assert samples
@@ -561,7 +593,7 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     )
     log_records = [
         json.loads(line)
-        for path in sorted((output_dir / "logs" / "game_000019").glob("*.jsonl"))
+        for path in sorted(log_run_dir.glob("game_001.player_*.jsonl"))
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
@@ -579,21 +611,35 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     )
     assert "DEEPSEEK_API_KEY" not in json.dumps(samples)
     assert "fake-for-test" not in json.dumps(samples)
-    assert (output_dir / "failures.jsonl").exists()
-    assert (output_dir / "failures.jsonl").read_text(encoding="utf-8") == ""
+    assert failures_path.read_text(encoding="utf-8") == ""
     assert json.loads(Path(result["audit_path"]).read_text(encoding="utf-8")) == audit
+    assert len(ToMDataset(samples_path)) > 0
+
+    with pytest.raises(FileExistsError, match="run directory already exists"):
+        collect_from_config(
+            config,
+            games=1,
+            run_id="game_001",
+            data_dir=data_root,
+            log_dir=log_root,
+            backends={"deepseek": DeterministicFakeBackend()},
+            env={"DEEPSEEK_API_KEY": "fake-for-test"},
+        )
 
 
 def test_one_fake_game_preserves_explicit_empty_speech_and_completes_audit(tmp_path):
     config = _config()
     config["seed"] = 21
-    output_dir = tmp_path / "pilot_empty"
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
     backend = EmptySpeechFakeBackend()
 
     result = collect_from_config(
         config,
         games=1,
-        output_dir=output_dir,
+        run_id="game_002",
+        data_dir=data_root,
+        log_dir=log_root,
         backends={"deepseek": backend},
         env={"DEEPSEEK_API_KEY": "fake-for-test"},
     )
@@ -607,6 +653,7 @@ def test_one_fake_game_preserves_explicit_empty_speech_and_completes_audit(tmp_p
     assert audit["parser_empty_count"] == audit["speech_event_count"]
     assert audit["parser_success_count"] == 0
     assert audit["parser_failure_count"] == 0
+    assert audit["parser_failure_rate"] == 0.0
     assert audit["parser_repair_attempts"] == 0
     assert audit["parsed_semantic_event_count"] == 0
     assert audit["speech_without_semantic_events"] == audit["speech_event_count"]
@@ -616,7 +663,9 @@ def test_one_fake_game_preserves_explicit_empty_speech_and_completes_audit(tmp_p
 
     samples = [
         json.loads(line)
-        for line in (output_dir / "samples.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (
+            data_root / "game_002" / "game_002.samples.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     raw_speech = {
@@ -643,36 +692,54 @@ def test_one_fake_game_preserves_explicit_empty_speech_and_completes_audit(tmp_p
 def test_gameplay_failure_writes_partial_audit_and_is_not_trainable(tmp_path):
     config = _config()
     config["seed"] = 23
-    output_dir = tmp_path / "pilot_failed"
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
 
     with pytest.raises(RuntimeError, match="invalid_json"):
         collect_from_config(
             config,
             games=1,
-            output_dir=output_dir,
+            run_id="game_003",
+            data_dir=data_root,
+            log_dir=log_root,
             backends={"deepseek": InvalidGameplayFakeBackend()},
             env={"DEEPSEEK_API_KEY": "fake-secret-must-not-leak"},
         )
 
-    for name in ("samples.jsonl", "failures.jsonl", "samples.audit.json", "logs"):
-        assert (output_dir / name).exists()
-    audit = json.loads((output_dir / "samples.audit.json").read_text(encoding="utf-8"))
+    data_run_dir = data_root / "game_003"
+    log_run_dir = log_root / "game_003"
+    samples_path = data_run_dir / "game_003.samples.jsonl"
+    for name in (
+        "game_003.samples.jsonl",
+        "game_003.failures.jsonl",
+        "game_003.audit.json",
+    ):
+        assert (data_run_dir / name).is_file()
+    assert (log_run_dir / "game_003.game_log.json").is_file()
+    assert all(
+        (log_run_dir / f"game_003.player_{player_id}.jsonl").is_file()
+        for player_id in range(1, 8)
+    )
+    audit = json.loads(
+        (data_run_dir / "game_003.audit.json").read_text(encoding="utf-8")
+    )
     assert audit["schema_version"] == "tom.audit.v1_4"
     assert audit["collection_status"] == "failed"
     assert audit["completed_games"] == 0
     assert audit["runtime_failure_count"] == 1
-    assert audit["failed_game_id"] == "game_000023"
+    assert audit["failed_game_id"] == "game_003"
     assert audit["runtime_error_type"] == "RuntimeError"
     assert audit["runtime_error_message"] == (
         "gameplay action generation failed: invalid_json"
     )
+    assert audit["parser_failure_rate"] is None
     rendered_audit = json.dumps(audit, ensure_ascii=False)
     assert "fake-secret-must-not-leak" not in rendered_audit
     assert "【游戏规则】" not in rendered_audit
 
     log_records = [
         json.loads(line)
-        for path in (output_dir / "logs" / "game_000023").glob("*.jsonl")
+        for path in log_run_dir.glob("game_003.player_*.jsonl")
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
@@ -684,13 +751,14 @@ def test_gameplay_failure_writes_partial_audit_and_is_not_trainable(tmp_path):
     assert log_records[0]["error_code"] == "invalid_json"
     assert log_records[0]["action"] is None
     with pytest.raises(ValueError, match="failed collection audit"):
-        ToMDataset(output_dir / "samples.jsonl")
+        ToMDataset(samples_path)
 
 
 def test_audit_fatal_preserves_all_pilot_outputs(tmp_path, monkeypatch):
     config = _config()
     config["seed"] = 19
-    output_dir = tmp_path / "pilot_fatal"
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
 
     def forced_failure(_audit):
         raise RuntimeError("forced audit failure")
@@ -700,15 +768,23 @@ def test_audit_fatal_preserves_all_pilot_outputs(tmp_path, monkeypatch):
         collect_from_config(
             config,
             games=1,
-            output_dir=output_dir,
+            run_id="game_004",
+            data_dir=data_root,
+            log_dir=log_root,
             backends={"deepseek": DeterministicFakeBackend()},
             env={"DEEPSEEK_API_KEY": "fake-for-test"},
         )
-    for name in ("samples.jsonl", "failures.jsonl", "samples.audit.json"):
-        assert (output_dir / name).is_file()
+    for name in (
+        "game_004.samples.jsonl",
+        "game_004.failures.jsonl",
+        "game_004.audit.json",
+    ):
+        assert (data_root / "game_004" / name).is_file()
 
 
-def test_collect_cli_help_and_summary_include_output_dir(tmp_path, monkeypatch, capsys):
+def test_collect_cli_requires_run_id_rejects_output_dir_and_reports_paths(
+    tmp_path, monkeypatch, capsys
+):
     project_root = Path(__file__).parents[2]
     help_result = subprocess.run(
         [sys.executable, "-m", "script.tom.collect", "--help"],
@@ -718,17 +794,53 @@ def test_collect_cli_help_and_summary_include_output_dir(tmp_path, monkeypatch, 
         check=False,
     )
     assert help_result.returncode == 0
-    assert "--output-dir OUTPUT_DIR" in help_result.stdout
+    assert "--run-id RUN_ID" in help_result.stdout
+    assert "--data-dir DATA_DIR" in help_result.stdout
+    assert "--log-dir LOG_DIR" in help_result.stdout
+    assert "--output-dir" not in help_result.stdout
 
-    output_dir = tmp_path / "pilot_summary"
+    missing_run_id = subprocess.run(
+        [sys.executable, "-m", "script.tom.collect", "--games", "1"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert missing_run_id.returncode == 2
+    assert "--run-id" in missing_run_id.stderr
+
+    legacy_output = subprocess.run(
+        [
+            sys.executable, "-m", "script.tom.collect", "--games", "1",
+            "--run-id", "game_001", "--output-dir", str(tmp_path / "old"),
+        ],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert legacy_output.returncode == 2
+    assert "unrecognized arguments" in legacy_output.stderr
+
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
     captured = {}
 
-    def fake_collect(config, *, games, output_dir, **_kwargs):
-        captured.update(games=games, output_dir=output_dir)
+    def fake_collect(config, *, games, run_id, data_dir, log_dir, **_kwargs):
+        captured.update(
+            games=games, run_id=run_id, data_dir=data_dir, log_dir=log_dir
+        )
         return {
             "games": [{}],
-            "output_dir": str(Path(output_dir).resolve()),
-            "audit_path": str(Path(output_dir).resolve() / "samples.audit.json"),
+            "run_id": run_id,
+            "data_run_dir": str(Path(data_dir).resolve() / run_id),
+            "log_run_dir": str(Path(log_dir).resolve() / run_id),
+            "samples_path": str(
+                Path(data_dir).resolve() / run_id / f"{run_id}.samples.jsonl"
+            ),
+            "audit_path": str(
+                Path(data_dir).resolve() / run_id / f"{run_id}.audit.json"
+            ),
             "audit": {
                 "unique_belief_elicitations": 1,
                 "successful_guesses": 1,
@@ -745,25 +857,42 @@ def test_collect_cli_help_and_summary_include_output_dir(tmp_path, monkeypatch, 
         "argv",
         [
             "collect.py", "--config", "configs/tom/collect.yaml",
-            "--games", "1", "--output-dir", str(output_dir),
+            "--games", "1", "--run-id", "game_001",
+            "--data-dir", str(data_root), "--log-dir", str(log_root),
         ],
     )
     collect_module.main()
     summary = json.loads(capsys.readouterr().out)
-    assert captured == {"games": 1, "output_dir": str(output_dir)}
-    assert summary["output_dir"] == str(output_dir.resolve())
-    assert summary["audit_path"] == str(output_dir.resolve() / "samples.audit.json")
-
-
-def test_generated_pilot_data_is_ignored_but_fixture_is_tracked():
-    project_root = Path(__file__).parents[2]
-    generated = subprocess.run(
-        ["git", "check-ignore", "-v", "data/tom/pilot_test/samples.jsonl"],
-        cwd=project_root,
-        text=True,
-        capture_output=True,
-        check=False,
+    assert captured == {
+        "games": 1,
+        "run_id": "game_001",
+        "data_dir": str(data_root),
+        "log_dir": str(log_root),
+    }
+    assert summary["run_id"] == "game_001"
+    assert summary["data_run_dir"] == str(data_root.resolve() / "game_001")
+    assert summary["log_run_dir"] == str(log_root.resolve() / "game_001")
+    assert summary["audit_path"] == str(
+        data_root.resolve() / "game_001" / "game_001.audit.json"
     )
+
+
+def test_generated_game_runs_are_ignored_but_fixed_resources_are_tracked():
+    project_root = Path(__file__).parents[2]
+    generated_paths = (
+        "data/game_001/game_001.samples.jsonl",
+        "logs/game_001/game_001.player_1.jsonl",
+    )
+    generated = [
+        subprocess.run(
+            ["git", "check-ignore", "-v", path],
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        for path in generated_paths
+    ]
     fixture = subprocess.run(
         ["git", "check-ignore", "-v", "tests/fixtures/tom_v1.jsonl"],
         cwd=project_root,
@@ -771,7 +900,17 @@ def test_generated_pilot_data_is_ignored_but_fixture_is_tracked():
         capture_output=True,
         check=False,
     )
-    assert generated.returncode == 0
-    assert "data/tom/**/*.jsonl" in generated.stdout
+    docs = subprocess.run(
+        ["git", "check-ignore", "-v", "data/docs/reference.md"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert all(result.returncode == 0 for result in generated)
+    assert "data/game_*/" in generated[0].stdout
+    assert "logs/game_*/" in generated[1].stdout
     assert fixture.returncode == 1
     assert fixture.stdout == ""
+    assert docs.returncode == 1
+    assert docs.stdout == ""
