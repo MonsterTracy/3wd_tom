@@ -127,8 +127,32 @@ def build_audit_report(
     *,
     game_ids=(),
     max_sequence_length=512,
+    collection_status="complete",
+    completed_games=None,
+    failed_game_id=None,
+    runtime_error_type=None,
+    runtime_error_message=None,
 ):
     """Build deterministic collection statistics without changing any records."""
+
+    if collection_status not in {"complete", "failed"}:
+        raise ValueError("collection_status must be complete or failed")
+    runtime_failure_count = 1 if collection_status == "failed" else 0
+    if collection_status == "complete":
+        if any(
+            value is not None
+            for value in (failed_game_id, runtime_error_type, runtime_error_message)
+        ):
+            raise ValueError("complete collection cannot carry a runtime failure")
+    else:
+        for value, name in (
+            (failed_game_id, "failed_game_id"),
+            (runtime_error_type, "runtime_error_type"),
+            (runtime_error_message, "runtime_error_message"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"failed collection requires {name}")
+        runtime_error_message = " ".join(runtime_error_message.split())[:1000]
 
     successful = list(samples)
     records = successful + list(failures)
@@ -553,8 +577,18 @@ def build_audit_report(
         "p99": _percentile(sequence_lengths, 0.99),
         "max": max(sequence_lengths, default=0),
     }
+    if completed_games is None:
+        completed_games = len(games) if collection_status == "complete" else 0
+    if type(completed_games) is not int or not 0 <= completed_games <= len(games):
+        raise ValueError("completed_games must be within the audited game count")
     return {
-        "schema_version": "tom.audit.v1_3",
+        "schema_version": "tom.audit.v1_4",
+        "collection_status": collection_status,
+        "completed_games": completed_games,
+        "runtime_failure_count": runtime_failure_count,
+        "failed_game_id": failed_game_id,
+        "runtime_error_type": runtime_error_type,
+        "runtime_error_message": runtime_error_message,
         "games": len(games),
         "public_checkpoints": len(public_checkpoints),
         "private_checkpoints": len(private_checkpoints),
@@ -655,6 +689,8 @@ def build_audit_report(
 
 
 def assert_audit_passes(report):
+    if report.get("schema_version") != "tom.audit.v1_4":
+        raise RuntimeError("collection audit failed: unsupported schema_version")
     fatal_fields = (
         "duplicate_sample_ids",
         "duplicate_first_order_keys",
@@ -676,6 +712,10 @@ def assert_audit_passes(report):
         "parser_utterance_mismatch_count",
     )
     failures = {name: report.get(name, 0) for name in fatal_fields if report.get(name, 0)}
+    if report.get("collection_status") != "complete":
+        failures["collection_status"] = report.get("collection_status")
+    if report.get("runtime_failure_count") != 0:
+        failures["runtime_failure_count"] = report.get("runtime_failure_count")
     for field in (
         "prompt_protocol_ids",
         "gameplay_prompt_hashes",
@@ -701,7 +741,10 @@ def assert_audit_passes(report):
         ]
     if parser_calls != parser_outcomes:
         failures["parser_call_outcome_invariant"] = [parser_calls, parser_outcomes]
-    if speech_count > 0 and report.get("parsed_semantic_event_count", 0) == 0:
+    if (
+        report.get("parser_success_count", 0) > 0
+        and report.get("parsed_semantic_event_count", 0) == 0
+    ):
         failures["parsed_semantic_event_count"] = 0
     parser_failure_count = report.get("parser_failure_count", 0)
     if parser_calls and parser_failure_count / parser_calls > PARSER_FAILURE_RATE_LIMIT:

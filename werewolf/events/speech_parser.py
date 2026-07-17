@@ -289,6 +289,18 @@ class SpeechEventParser:
         self.temperature = 0.0
 
     def parse(self, *, utterance, utterance_id, day, phase, turn, speaker):
+        if not isinstance(utterance, str):
+            raise TypeError("utterance must be text")
+        if not utterance.strip():
+            return SpeechParseResult(
+                status="empty",
+                events=(),
+                raw_text=(),
+                error=None,
+                error_code=None,
+                attempts=1,
+                model=self.model,
+            )
         raw_text = []
         error = None
         error_code = None

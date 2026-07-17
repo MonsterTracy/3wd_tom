@@ -77,10 +77,10 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     )
     assert checkpoint["prompt_protocol"]["prompt_language"] == "zh-CN"
     assert checkpoint["prompt_protocol"]["prompt_protocol_version"] == (
-        "prompt_protocol.zh.v4"
+        "prompt_protocol.zh.v5"
     )
     assert checkpoint["prompt_protocol"]["gameplay_prompt_version"] == (
-        "gameplay.zh.v2"
+        "gameplay.zh.v3"
     )
     assert checkpoint["prompt_protocol"]["belief_prompt_version"] == (
         "belief.zh.v3"
@@ -117,7 +117,7 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     )
     mismatched_path = tmp_path / "mismatched.jsonl"
     mismatched_path.write_text(json.dumps(mismatched) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="prompt protocol"):
+    with pytest.raises(ValueError, match="prompt.protocol|canonical prompt"):
         evaluate_from_config(
             {
                 "schema_version": "evaluate.v1",

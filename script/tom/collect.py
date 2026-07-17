@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from werewolf.backends import load_named_backends
+from werewolf.backends import BackendError, load_named_backends
 from werewolf.runtime import build_collection_runtime, rollout, shuffled_roles
 from werewolf.runtime_config import (
     resolve_collection_output,
@@ -129,6 +129,18 @@ def _read_jsonl(path):
     return records
 
 
+def _safe_runtime_error(exc):
+    error_type = type(exc).__name__
+    message = str(exc)
+    if isinstance(exc, BackendError) or message.startswith(
+        ("gameplay action generation failed:", "rollout exceeded max_steps=")
+    ):
+        safe_message = " ".join(message.split())[:1000]
+    else:
+        safe_message = "collection rollout failed"
+    return error_type, safe_message
+
+
 def collect_from_config(
     config, *, games=None, output_dir=None, backends=None, env=None
 ):
@@ -169,18 +181,35 @@ def collect_from_config(
         if log_directory.exists():
             shutil.rmtree(log_directory)
         roles = shuffled_roles(game_config["environment"], game_config["seed"])
-        environment, agents = build_collection_runtime(
-            game_config,
-            game_id=game_id,
-            roles=roles,
-            backends=backends,
-        )
-        result = rollout(
-            environment,
-            agents,
-            roles,
-            max_steps=game_config["max_steps"],
-        )
+        try:
+            environment, agents = build_collection_runtime(
+                game_config,
+                game_id=game_id,
+                roles=roles,
+                backends=backends,
+            )
+            result = rollout(
+                environment,
+                agents,
+                roles,
+                max_steps=game_config["max_steps"],
+            )
+        except Exception as exc:
+            samples = _read_jsonl(samples_path)
+            failures = _read_jsonl(config["output"]["failures"])
+            error_type, error_message = _safe_runtime_error(exc)
+            audit = build_audit_report(
+                samples,
+                failures,
+                game_ids=[item["game_id"] for item in results] + [game_id],
+                collection_status="failed",
+                completed_games=len(results),
+                failed_game_id=game_id,
+                runtime_error_type=error_type,
+                runtime_error_message=error_message,
+            )
+            _write_audit_atomically(audit_path, audit)
+            raise
         results.append({"game_id": game_id, "roles": roles, **result})
     samples = _read_jsonl(samples_path)
     failures = _read_jsonl(config["output"]["failures"])

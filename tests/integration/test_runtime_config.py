@@ -23,6 +23,7 @@ from werewolf.prompt_protocol import (
     protocol_id_from_references,
 )
 from werewolf.runtime_config import resolve_collection_output, validate_runtime_config
+from werewolf.tom.dataset import ToMDataset
 
 
 def _config():
@@ -403,6 +404,31 @@ class DeterministicFakeBackend:
         return '{"action_index":1}'
 
 
+class EmptySpeechFakeBackend(DeterministicFakeBackend):
+    def chat(self, messages, **kwargs):
+        system = messages[0]["content"] if messages[0]["role"] == "system" else ""
+        if system not in {PARSER_SYSTEM_PROMPT, BELIEF_SYSTEM_PROMPT}:
+            prompt = messages[1]["content"]
+            if '{"speech":"..."}' in prompt:
+                return '{"speech":""}'
+            match = re.search(
+                r"【当前合法动作】\n(\[.*?\])\n\n【当前阶段任务】",
+                prompt,
+                re.DOTALL,
+            )
+            actions = json.loads(match.group(1))
+            return json.dumps({"action_index": 1 if len(actions) > 1 else 0})
+        return super().chat(messages, **kwargs)
+
+
+class InvalidGameplayFakeBackend(DeterministicFakeBackend):
+    def chat(self, messages, **kwargs):
+        system = messages[0]["content"] if messages[0]["role"] == "system" else ""
+        if system not in {PARSER_SYSTEM_PROMPT, BELIEF_SYSTEM_PROMPT}:
+            return '{“action_index”:0}'
+        return super().chat(messages, **kwargs)
+
+
 def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_path):
     config = _config()
     config["seed"] = 19
@@ -430,6 +456,13 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert not list(output_dir.glob(".samples.audit.json.*.tmp"))
     assert len(result["games"]) == 1
     assert result["games"][0]["winner"] in {"Werewolf", "Village"}
+    assert audit["schema_version"] == "tom.audit.v1_4"
+    assert audit["collection_status"] == "complete"
+    assert audit["completed_games"] == 1
+    assert audit["runtime_failure_count"] == 0
+    assert audit["failed_game_id"] is None
+    assert audit["runtime_error_type"] is None
+    assert audit["runtime_error_message"] is None
     assert audit["games"] == 1
     assert audit["unique_belief_elicitations"] > 0
     assert audit["successful_guesses"] == audit["unique_belief_elicitations"]
@@ -535,7 +568,7 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert log_records
     assert all(
         record["gameplay_prompt"] == {
-            "version": "gameplay.zh.v2",
+            "version": "gameplay.zh.v3",
             "sha256": GAMEPLAY_PROMPT_SPEC["sha256"],
         }
         and record["model"] == "deepseek-chat"
@@ -549,6 +582,109 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert (output_dir / "failures.jsonl").exists()
     assert (output_dir / "failures.jsonl").read_text(encoding="utf-8") == ""
     assert json.loads(Path(result["audit_path"]).read_text(encoding="utf-8")) == audit
+
+
+def test_one_fake_game_preserves_explicit_empty_speech_and_completes_audit(tmp_path):
+    config = _config()
+    config["seed"] = 21
+    output_dir = tmp_path / "pilot_empty"
+    backend = EmptySpeechFakeBackend()
+
+    result = collect_from_config(
+        config,
+        games=1,
+        output_dir=output_dir,
+        backends={"deepseek": backend},
+        env={"DEEPSEEK_API_KEY": "fake-for-test"},
+    )
+
+    audit = result["audit"]
+    assert audit["collection_status"] == "complete"
+    assert audit["completed_games"] == 1
+    assert audit["runtime_failure_count"] == 0
+    assert audit["speech_event_count"] > 0
+    assert audit["parser_call_count"] == audit["speech_event_count"]
+    assert audit["parser_empty_count"] == audit["speech_event_count"]
+    assert audit["parser_success_count"] == 0
+    assert audit["parser_failure_count"] == 0
+    assert audit["parser_repair_attempts"] == 0
+    assert audit["parsed_semantic_event_count"] == 0
+    assert audit["speech_without_semantic_events"] == audit["speech_event_count"]
+    assert audit["public_checkpoints"] > 0
+    assert audit["first_order_samples"] > 0
+    assert backend.parser_calls == 0
+
+    samples = [
+        json.loads(line)
+        for line in (output_dir / "samples.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    raw_speech = {
+        event["event_id"]: event
+        for sample in samples
+        for event in sample["events"]
+        if event["source_type"] == "environment"
+        and event["content"]["kind"] == "SPEECH"
+    }
+    assert raw_speech
+    assert all(event["source_span"] == "" for event in raw_speech.values())
+    assert all(
+        event["metadata"]["parser_result"]["status"] == "empty"
+        and event["metadata"]["parser_result"]["attempts"] == 1
+        for event in raw_speech.values()
+    )
+    assert not any(
+        event["source_type"] == "speech_parser"
+        for sample in samples
+        for event in sample["events"]
+    )
+
+
+def test_gameplay_failure_writes_partial_audit_and_is_not_trainable(tmp_path):
+    config = _config()
+    config["seed"] = 23
+    output_dir = tmp_path / "pilot_failed"
+
+    with pytest.raises(RuntimeError, match="invalid_json"):
+        collect_from_config(
+            config,
+            games=1,
+            output_dir=output_dir,
+            backends={"deepseek": InvalidGameplayFakeBackend()},
+            env={"DEEPSEEK_API_KEY": "fake-secret-must-not-leak"},
+        )
+
+    for name in ("samples.jsonl", "failures.jsonl", "samples.audit.json", "logs"):
+        assert (output_dir / name).exists()
+    audit = json.loads((output_dir / "samples.audit.json").read_text(encoding="utf-8"))
+    assert audit["schema_version"] == "tom.audit.v1_4"
+    assert audit["collection_status"] == "failed"
+    assert audit["completed_games"] == 0
+    assert audit["runtime_failure_count"] == 1
+    assert audit["failed_game_id"] == "game_000023"
+    assert audit["runtime_error_type"] == "RuntimeError"
+    assert audit["runtime_error_message"] == (
+        "gameplay action generation failed: invalid_json"
+    )
+    rendered_audit = json.dumps(audit, ensure_ascii=False)
+    assert "fake-secret-must-not-leak" not in rendered_audit
+    assert "【游戏规则】" not in rendered_audit
+
+    log_records = [
+        json.loads(line)
+        for path in (output_dir / "logs" / "game_000023").glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(log_records) == 1
+    assert log_records[0]["attempts"] == 2
+    assert log_records[0]["responses"] == [
+        '{“action_index”:0}', '{“action_index”:0}'
+    ]
+    assert log_records[0]["error_code"] == "invalid_json"
+    assert log_records[0]["action"] is None
+    with pytest.raises(ValueError, match="failed collection audit"):
+        ToMDataset(output_dir / "samples.jsonl")
 
 
 def test_audit_fatal_preserves_all_pilot_outputs(tmp_path, monkeypatch):

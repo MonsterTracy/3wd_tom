@@ -38,6 +38,62 @@ class SequenceBackend:
         return response
 
 
+@pytest.mark.parametrize("utterance", ["", "  \t\n"])
+def test_speech_parser_short_circuits_blank_utterance(utterance):
+    backend = SequenceBackend([])
+    result = SpeechEventParser(backend, "parser").parse(
+        utterance=utterance,
+        utterance_id="blank",
+        day=1,
+        phase="speech",
+        turn=4,
+        speaker=1,
+    )
+
+    assert result.status == "empty"
+    assert result.events == ()
+    assert result.raw_text == ()
+    assert result.error is None
+    assert result.error_code is None
+    assert result.attempts == 1
+    assert result.model == "parser"
+    assert backend.calls == []
+
+
+def test_speech_parser_rejects_non_text_utterance_before_backend():
+    backend = SequenceBackend([])
+    with pytest.raises(TypeError, match="utterance must be text"):
+        SpeechEventParser(backend, "parser").parse(
+            utterance=None,
+            utterance_id="invalid",
+            day=1,
+            phase="speech",
+            turn=4,
+            speaker=1,
+        )
+    assert backend.calls == []
+
+
+def test_speech_parser_semantic_event_still_rejects_empty_source_span():
+    response = (
+        '{"events":[{"event_family":"BELIEF_ASSERTION","target":[2],'
+        '"content":{"kind":"CAMP","value":"Werewolf"},"qualifier":{},'
+        '"ref_event_id":null,"source_span":"","parser_confidence":0.9}]}'
+    )
+    result = SpeechEventParser(SequenceBackend([response, response]), "parser").parse(
+        utterance="2号像狼",
+        utterance_id="empty-span",
+        day=1,
+        phase="speech",
+        turn=4,
+        speaker=1,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "schema_validation"
+    assert result.attempts == 2
+
+
 def test_speech_parser_repairs_once_and_emits_only_local_families():
     backend = SequenceBackend(
         [
@@ -128,7 +184,7 @@ def test_parser_backend_error_boundary_does_not_change_prompt_protocol():
         "text": PARSER_PROMPT_SPEC["text"],
     }
     assert protocol_id_from_specs(CANONICAL_PROMPT_SPECS) == (
-        "sha256:ad69ce60dc4311d33106765c41b761bfc4298096dc72180215eb3bf26b70f744"
+        "sha256:07a6d57ed4d79a046a42238291ac12c7de9b7f83c16f3b42e046c8f3d76515d9"
     )
 
 

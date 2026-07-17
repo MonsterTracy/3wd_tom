@@ -102,10 +102,12 @@ python -m script.tom.collect \
 
 Every pilot must use a new `--output-dir`; the collect command creates it and
 refuses any path that already exists. Generated JSON/JSONL under `data/tom/` is
-ignored by Git. If the audit fails, samples, failures, and audit output remain in
-that directory for diagnosis, so do not reuse an old pilot directory.
+ignored by Git. If gameplay or the audit fails, partial samples, failures, logs,
+and `samples.audit.json` remain in that directory for diagnosis. Such an audit
+has `collection_status="failed"`; its samples are not trainable, and the dataset
+loader rejects them. Do not reuse an old pilot directory.
 
-## Ruleset and Prompt Protocol V4
+## Ruleset and Prompt Protocol V5
 
 `werewolf/game_rules.py` is the sole machine-readable game-rule source. The
 current ruleset is `werewolf_7p.zh.v1` (`id: werewolf_7p`) and covers both
@@ -113,13 +115,16 @@ supported seven-player variants, `seer_witch` and `seer_guard`. Prompt text
 renders rules from that module; this README intentionally does not duplicate
 the complete rules.
 
-`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V4. Its formal
+`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V5. Its formal
 instruction language is Chinese (`language: zh-CN`) and it has three canonical
 protocols:
 
-- `gameplay.zh.v2` layers rendered global rules, current-role rules, visibility
+- `gameplay.zh.v3` layers rendered global rules, current-role rules, visibility
   boundaries, and phase tasks. Its dynamic message separates confirmed private
-  facts, public objective events, and untrusted public player claims.
+  facts, public objective events, and untrusted public player claims. Gameplay
+  output uses strict Python-parseable JSON; backend retries and semantic repair
+  are separate, and invalid actions terminate the rollout instead of falling
+  back to synthetic actions.
 - `belief.zh.v3` measures one player's private joint MAP belief over the complete
   two-Werewolf pair from the same three information partitions. Its canonical
   messages include the lowercase `json` instruction required by JSON Output. It
@@ -148,8 +153,8 @@ controlled enums, user/repair structures, and every few-shot. Dynamic values,
 event history, model responses, and credentials are excluded. The derived
 `protocol_id` also includes the ruleset ID, version, and hash. These references
 are written to `tom.v1_1` samples, audits, parser metadata, gameplay logs, and
-checkpoints. The strict loader rejects Prompt Protocol V1 rather than adapting
-it.
+checkpoints. The strict loader rejects earlier Prompt Protocol versions rather
+than adapting them.
 
 Prompt metadata is a data-generation condition, not a model feature. A trained
 model therefore represents the behavior distribution induced by its recorded
@@ -170,7 +175,8 @@ cross-entropy objective.
 
 ## Data contract
 
-Only successful `tom.v1_1` JSONL records are trainable. Each record names its
+Only successful `tom.v1_1` JSONL records from a complete collection audit are
+trainable. Each record names its
 task/mode/checkpoint, carries the exact input events and 21-way output mask, and
 stores the elicited pair/index plus raw elicitation metadata and one required
 `prompt_protocol` object containing the unique `ruleset` reference. Failed

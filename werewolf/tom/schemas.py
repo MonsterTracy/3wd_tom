@@ -7,6 +7,7 @@ from werewolf.events.schema import validate_event
 from werewolf.events.streams import knowledge_for_player
 from werewolf.game_rules import canonical_ruleset_metadata
 from werewolf.prompt_protocol import (
+    CANONICAL_PROMPT_SPECS,
     PROMPT_LANGUAGE,
     PROMPT_NAMES,
     PROMPT_PROTOCOL_VERSION,
@@ -93,7 +94,7 @@ def _validate_runtime_model(value, name):
 
 def validate_prompt_protocol(prompt_protocol) -> bool:
     if not isinstance(prompt_protocol, dict) or set(prompt_protocol) != PROMPT_PROTOCOL_FIELDS:
-        raise ValueError("prompt_protocol fields do not match prompt_protocol.zh.v4")
+        raise ValueError("prompt_protocol fields do not match prompt_protocol.zh.v5")
     if prompt_protocol["protocol_version"] != PROMPT_PROTOCOL_VERSION:
         raise ValueError("unsupported prompt_protocol version")
     if prompt_protocol["language"] != PROMPT_LANGUAGE:
@@ -116,6 +117,14 @@ def validate_prompt_protocol(prompt_protocol) -> bool:
             reference["sha256"]
         ):
             raise ValueError(f"prompt_protocol.{name}.sha256 is invalid")
+        canonical_reference = {
+            "version": CANONICAL_PROMPT_SPECS[name]["version"],
+            "sha256": CANONICAL_PROMPT_SPECS[name]["sha256"],
+        }
+        if reference != canonical_reference:
+            raise ValueError(
+                f"prompt_protocol.{name} does not match the canonical prompt"
+            )
         references[name] = reference
     protocol_id = prompt_protocol["protocol_id"]
     if not isinstance(protocol_id, str) or not re.fullmatch(

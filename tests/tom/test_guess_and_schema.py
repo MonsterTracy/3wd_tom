@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from werewolf.agents.llm_agent import LLMAgent
+from werewolf.agents.llm_agent import GameplayValidationError, LLMAgent
 from werewolf.backends.base import BackendError
 from werewolf.events.environment_events import (
     check_result_event,
@@ -41,6 +41,7 @@ from werewolf.prompt_protocol import (
     prompt_sha256,
     protocol_id_from_references,
     protocol_id_from_specs,
+    gameplay_repair_message,
     render_gameplay_phase_task,
 )
 from werewolf.tom.dataset import ToMDataset
@@ -92,10 +93,10 @@ def _elicit(provider, *, player_view="view", required=(), forbidden=(3,), mask=N
 
 
 def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
-    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v4"
+    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v5"
     assert PROMPT_LANGUAGE == "zh-CN"
     expected_versions = {
-        "gameplay": "gameplay.zh.v2",
+        "gameplay": "gameplay.zh.v3",
         "belief": "belief.zh.v3",
         "parser": "parser.zh.v3",
     }
@@ -116,7 +117,7 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
     changed = dict(CANONICAL_PROMPT_SPECS)
     changed["gameplay"] = make_prompt_spec(
         name="gameplay",
-        version="gameplay.zh.v2",
+        version="gameplay.zh.v3",
         text=GAMEPLAY_PROMPT_SPEC["text"] + "\n变更。",
     )
     assert protocol_id_from_specs(changed) != first
@@ -126,19 +127,22 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
         "sha256": "7d45ee4a8957001b6c2ea44c3b9ec9afba99fe1235ad07147d6c6c1ccd9a6bc1",
     }
     assert GAMEPLAY_PROMPT_SPEC["sha256"] == (
-        "06f5b4865163af4ccad8c90e77525a8f95fe578ca45fcbd47f52946381506adc"
+        "c934af55236f82b2a4951b349c36711111e7c400be243076b9a6f59f875ecf4a"
     )
-    assert PARSER_PROMPT_SPEC["sha256"] != (
-        "8f796886879c3303feffa3ecf9915eeaf07ea6ce817433ba8a1734ea59ca84f7"
+    assert PARSER_PROMPT_SPEC["sha256"] == (
+        "0e8d205bc640273c450a10d6760076e6db3fab4547796476d5fa59a0f31732a4"
     )
-    assert BELIEF_PROMPT_SPEC["sha256"] != (
-        "926c54a36358f0d8848f0d7591000e152988420eea8b929880baa653881c6dab"
+    assert BELIEF_PROMPT_SPEC["sha256"] == (
+        "f2a41bb4080e8548218611404f956f88a98a0b49103e2a72f63a2f2242ecfe3f"
     )
     assert first != (
         "sha256:9e6ea40cedb78638d5fd9d3f66dbeb6bb8a3f6c6a15c44d59b68865d2453591e"
     )
     assert first != (
         "sha256:532d1d603ccde38d3195589a28e230dfe8d2827252e36f39486888d185512b34"
+    )
+    assert first == (
+        "sha256:07a6d57ed4d79a046a42238291ac12c7de9b7f83c16f3b42e046c8f3d76515d9"
     )
     assert '{"wolf_pair":[1,2]}' in json.loads(
         BELIEF_PROMPT_SPEC["text"]
@@ -211,9 +215,14 @@ def test_gameplay_prompt_separates_trusted_rules_from_dynamic_player_view(tmp_pa
     assert record["model"] == "gameplay-model"
     assert record["temperature"] == 0.7
     assert record["attempts"] == 2
+    assert record["error_code"] is None
     assert record["action"] == ["speech", "基于可见事件发言"]
-    assert "只返回符合当前阶段要求的有效 JSON" not in backend.messages[0][-1]["content"]
-    assert "只返回符合当前阶段要求的有效 JSON" in backend.messages[1][-1]["content"]
+    assert backend.messages[1][2] == {"role": "assistant", "content": "invalid"}
+    repair = backend.messages[1][3]["content"]
+    assert "Python json.loads" in repair
+    assert '半角英文双引号 "' in repair
+    assert "中文引号“”" in repair
+    assert '{"speech":"..."}' in repair
 
     action_observation = {
         "phase": "1_day_vote",
@@ -222,10 +231,134 @@ def test_gameplay_prompt_separates_trusted_rules_from_dynamic_player_view(tmp_pa
     assert LLMAgent._parse_response(
         '{"action_index":0}', action_observation
     ) == ("vote", 1)
-    with pytest.raises(ValueError, match="only action_index"):
+    with pytest.raises(GameplayValidationError) as captured:
         LLMAgent._parse_response(
             '{"action_index":0,"reason":"hidden"}', action_observation
         )
+    assert captured.value.code == "wrong_fields"
+
+
+@pytest.mark.parametrize(
+    ("response", "observation", "expected"),
+    [
+        ('{"speech":"文本"}', {"phase": "speech", "valid_actions": [("speech", "")]}, ("speech", "文本")),
+        ('{"speech":""}', {"phase": "speech", "valid_actions": [("speech", "")]}, ("speech", "")),
+        ('{"action_index":1}', {"phase": "vote", "valid_actions": [("vote", 0), ("vote", 2)]}, ("vote", 2)),
+    ],
+)
+def test_gameplay_response_accepts_only_strict_actions(response, observation, expected):
+    assert LLMAgent._parse_response(response, observation) == expected
+
+
+@pytest.mark.parametrize(
+    ("response", "observation", "error_code"),
+    [
+        ('{“speech”:“发言”}', {"phase": "speech", "valid_actions": [("speech", "")]}, "invalid_json"),
+        ('{"speech":"发言","extra":1}', {"phase": "speech", "valid_actions": [("speech", "")]}, "wrong_fields"),
+        ('{"speech":1}', {"phase": "speech", "valid_actions": [("speech", "")]}, "speech_not_text"),
+        ('{"action_index":"0"}', {"phase": "vote", "valid_actions": [("vote", 0)]}, "action_index_not_integer"),
+        ('{"action_index":1}', {"phase": "vote", "valid_actions": [("vote", 0)]}, "action_index_out_of_range"),
+    ],
+)
+def test_gameplay_response_classifies_validation_errors(
+    response, observation, error_code
+):
+    with pytest.raises(GameplayValidationError) as captured:
+        LLMAgent._parse_response(response, observation)
+    assert captured.value.code == error_code
+
+
+@pytest.mark.parametrize(
+    ("error_code", "phase", "expected"),
+    [
+        ("invalid_json", "speech", "Python json.loads"),
+        ("wrong_fields", "speech", "只允许 speech 字段"),
+        ("speech_not_text", "speech", "speech 必须是字符串"),
+        ("action_index_not_integer", "vote", "action_index 必须是整数"),
+        ("action_index_out_of_range", "vote", "0 到 1"),
+    ],
+)
+def test_gameplay_repair_is_programmatic_and_stage_specific(
+    error_code, phase, expected
+):
+    repair = gameplay_repair_message(
+        error_code, phase=phase, valid_action_count=2
+    )
+    assert expected in repair
+    assert '半角英文双引号 "' in repair
+    assert "中文引号“”" in repair
+    assert "Markdown" in repair
+    assert "额外字段" in repair
+
+
+def test_gameplay_retries_retryable_backend_with_identical_initial_messages():
+    backend = SequenceBackend(
+        [BackendError("temporary", retryable=True), '{"action_index":0}']
+    )
+    agent = LLMAgent(backend=backend, model_name="gameplay-model")
+    observation = {
+        "player_id": 1,
+        "role": "Villager",
+        "phase": "vote",
+        "valid_actions": [("vote", 0)],
+        "events": [],
+    }
+
+    assert agent.act(observation) == ("vote", 0)
+    assert backend.calls == 2
+    assert backend.messages[0] == backend.messages[1]
+    assert all(len(messages) == 2 for messages in backend.messages)
+
+
+def test_gameplay_nonretryable_backend_fails_once_without_repair(tmp_path):
+    backend = SequenceBackend([BackendError("bad request", retryable=False)])
+    log_file = tmp_path / "agent.jsonl"
+    agent = LLMAgent(
+        backend=backend, model_name="gameplay-model", log_file=log_file
+    )
+    observation = {
+        "player_id": 1,
+        "role": "Villager",
+        "phase": "vote",
+        "valid_actions": [("vote", 0), ("vote", 2)],
+        "events": [],
+    }
+
+    with pytest.raises(RuntimeError, match="gameplay action generation failed"):
+        agent.act(observation)
+    assert backend.calls == 1
+    assert len(backend.messages[0]) == 2
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    assert record["responses"] == []
+    assert record["error_code"] == "backend_error"
+    assert record["action"] is None
+
+
+def test_gameplay_two_semantic_failures_log_and_raise_without_fallback(tmp_path):
+    backend = SequenceBackend(['{“action_index”:0}', '{"action_index":9}'])
+    log_file = tmp_path / "agent.jsonl"
+    agent = LLMAgent(
+        backend=backend, model_name="gameplay-model", log_file=log_file
+    )
+    observation = {
+        "player_id": 1,
+        "role": "Villager",
+        "phase": "skill_wolf",
+        "valid_actions": [("kill", 0), ("kill", 2)],
+        "events": [],
+    }
+
+    with pytest.raises(RuntimeError, match="action_index_out_of_range"):
+        agent.act(observation)
+    assert backend.calls == 2
+    assert backend.messages[1][2] == {
+        "role": "assistant", "content": '{“action_index”:0}'
+    }
+    assert not hasattr(LLMAgent, "_fallback")
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    assert record["responses"] == ['{“action_index”:0}', '{"action_index":9}']
+    assert record["error_code"] == "action_index_out_of_range"
+    assert record["action"] is None
 
 
 def test_gameplay_and_belief_views_partition_facts_events_and_claims_once():
@@ -290,7 +423,9 @@ def test_prompt_hash_payload_covers_all_stable_templates_and_ruleset():
     belief = BELIEF_PROMPT_SPEC["text"]
     parser = PARSER_PROMPT_SPEC["text"]
     assert "GAMEPLAY_REPAIR" not in gameplay
-    assert "只返回符合当前阶段要求的有效 JSON" in gameplay
+    assert "Python json.loads" in gameplay
+    assert '半角英文双引号 "' in json.loads(gameplay)["json_requirements"]
+    assert "中文引号“”" in gameplay
     assert "【已确认私有事实】" in gameplay
     gameplay_payload = json.loads(gameplay)
     assert gameplay_payload["role_rules"]["seer_witch"]["Werewolf"] == (
@@ -333,6 +468,13 @@ def test_prompt_hash_payload_covers_all_stable_templates_and_ruleset():
     assert '{"action_index":0}' in vote_task
     assert '{"action_index":0}' in night_task
     assert "pass 只能在环境允许时选择" in night_task
+    for task in (speech_task, vote_task, night_task):
+        assert "小写 ASCII json" in task
+        assert "Python json.loads" in task
+        assert '半角英文双引号 "' in task
+        assert "中文引号“”" in task
+        assert "不输出 Markdown" in task
+        assert "不增加额外字段" in task
 
 
 def test_belief_prompt_encodes_joint_map_semantics_and_injection_boundary():
@@ -685,14 +827,6 @@ def test_tracking_ids_do_not_change_model_tensors_or_tokens():
             assert left == right
 
     metadata_changed = deepcopy(original)
-    metadata_changed["prompt_protocol"]["belief"]["sha256"] = "1" * 64
-    references = {
-        name: metadata_changed["prompt_protocol"][name]
-        for name in ("gameplay", "belief", "parser")
-    }
-    metadata_changed["prompt_protocol"]["protocol_id"] = (
-        protocol_id_from_references(references)
-    )
     metadata_changed["prompt_protocol"]["runtime"]["belief_profiles"][
         "fixture"
     ]["model"] = "different-provenance-model"
@@ -719,6 +853,21 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
     assert record["prompt_protocol"]["protocol_id"] == protocol_id_from_specs(
         CANONICAL_PROMPT_SPECS
     )
+
+    old_gameplay_v2 = deepcopy(record)
+    old_gameplay_v2["prompt_protocol"]["gameplay"] = {
+        "version": "gameplay.zh.v2",
+        "sha256": "06f5b4865163af4ccad8c90e77525a8f95fe578ca45fcbd47f52946381506adc",
+    }
+    old_v2_references = {
+        name: old_gameplay_v2["prompt_protocol"][name]
+        for name in ("gameplay", "belief", "parser")
+    }
+    old_gameplay_v2["prompt_protocol"]["protocol_id"] = (
+        protocol_id_from_references(old_v2_references)
+    )
+    with pytest.raises(ValueError, match="gameplay.*canonical prompt"):
+        validate_sample(old_gameplay_v2)
 
     missing = deepcopy(record)
     missing.pop("prompt_protocol")
@@ -820,7 +969,7 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
         json.dumps(record) + "\n" + json.dumps(mixed) + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="one prompt protocol"):
+    with pytest.raises(ValueError, match="canonical prompt|one prompt protocol"):
         ToMDataset(mixed_path)
 
 

@@ -25,6 +25,19 @@ class ToMDataset(Dataset):
         self.include_first_order_private = include_first_order_private
         for path in paths:
             path = Path(path)
+            audit_path = path.with_suffix(".audit.json")
+            if audit_path.exists():
+                try:
+                    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{audit_path}: invalid collection audit") from exc
+                if audit.get("schema_version") != "tom.audit.v1_4":
+                    raise ValueError(f"{audit_path}: unsupported collection audit")
+                if (
+                    audit.get("collection_status") != "complete"
+                    or audit.get("runtime_failure_count") != 0
+                ):
+                    raise ValueError(f"{path}: failed collection audit is not trainable")
             with path.open("r", encoding="utf-8") as source:
                 for line_number, line in enumerate(source, start=1):
                     if not line.strip():

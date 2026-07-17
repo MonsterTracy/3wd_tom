@@ -1,4 +1,4 @@
-"""Canonical Prompt Protocol V4 specifications and stable metadata helpers."""
+"""Canonical Prompt Protocol V5 specifications and stable metadata helpers."""
 
 from copy import deepcopy
 from hashlib import sha256
@@ -16,9 +16,9 @@ from werewolf.game_rules import (
 )
 
 
-PROMPT_PROTOCOL_VERSION = "prompt_protocol.zh.v4"
+PROMPT_PROTOCOL_VERSION = "prompt_protocol.zh.v5"
 PROMPT_LANGUAGE = "zh-CN"
-GAMEPLAY_PROMPT_VERSION = "gameplay.zh.v2"
+GAMEPLAY_PROMPT_VERSION = "gameplay.zh.v3"
 BELIEF_PROMPT_VERSION = "belief.zh.v3"
 PARSER_PROMPT_VERSION = "parser.zh.v3"
 PROMPT_NAMES = ("gameplay", "belief", "parser")
@@ -112,6 +112,7 @@ SPEECH_TASK_TEMPLATE = """你现在需要进行一次公开发言。
 6. 信息不足时可以明确表示暂时无法确定；
 7. 是否公开私有信息由当前玩家自主决定；
 8. 只输出公开发言，不输出分析过程。
+9. speech 必须是字符串；明确选择不发言时可以返回空字符串。
 
 只返回：
 {"speech":"..."}
@@ -143,7 +144,35 @@ ACTION_TASK_TEMPLATE = """你现在需要执行当前环境动作。
 只返回：
 {"action_index":0}"""
 
-GAMEPLAY_REPAIR_TEMPLATE = "只返回符合当前阶段要求的有效 JSON，不要输出其他内容。"
+GAMEPLAY_JSON_REQUIREMENTS = """输出协议：
+1. 只返回合法的小写 ASCII json；
+2. 必须能被 Python json.loads 直接解析；
+3. JSON 字符串必须使用半角英文双引号 "；
+4. 禁止使用中文引号“”；
+5. 不输出 Markdown；
+6. 不输出解释或思维过程；
+7. 不增加额外字段。"""
+
+GAMEPLAY_REPAIR_REASONS = {
+    "invalid_json": (
+        "上一条回复不是 Python json.loads 可解析的合法 json。"
+        "请使用半角英文双引号 \"，不要使用中文引号“”。"
+    ),
+    "wrong_fields.speech": "上一条 json 字段不符合当前阶段。发言阶段只允许 speech 字段。",
+    "wrong_fields.action": "上一条 json 字段不符合当前阶段。动作阶段只允许 action_index 字段。",
+    "speech_not_text": "上一条 speech 不是字符串。speech 必须是字符串。",
+    "action_index_not_integer": "上一条 action_index 不是严格整数。action_index 必须是整数。",
+    "action_index_out_of_range": (
+        "上一条 action_index 超出当前合法动作范围。"
+        "请从 0 到 {max_index} 中选择一个整数。"
+    ),
+}
+GAMEPLAY_REPAIR_TEMPLATE = """{diagnosis}
+
+{requirements}
+
+当前唯一允许格式：
+{expected_format}"""
 
 
 def build_gameplay_system_prompt(role: str, variant: str) -> str:
@@ -165,7 +194,7 @@ def render_gameplay_phase_task(role: str, phase: str, variant: str) -> str:
         task = NIGHT_TASK_TEMPLATE
     else:
         task = ACTION_TASK_TEMPLATE
-    return f"{phase_rules}\n\n{task}"
+    return f"{phase_rules}\n\n{task}\n\n{GAMEPLAY_JSON_REQUIREMENTS}"
 
 
 def render_gameplay_user_message(
@@ -186,8 +215,27 @@ def render_gameplay_user_message(
     )
 
 
-def gameplay_repair_message() -> str:
-    return GAMEPLAY_REPAIR_TEMPLATE
+def gameplay_repair_message(
+    error_code: str, *, phase: str, valid_action_count: int
+) -> str:
+    is_speech = "speech" in phase
+    reason_key = error_code
+    if error_code == "wrong_fields":
+        reason_key = "wrong_fields.speech" if is_speech else "wrong_fields.action"
+    try:
+        diagnosis = GAMEPLAY_REPAIR_REASONS[reason_key]
+    except KeyError as exc:
+        raise ValueError(f"unsupported gameplay repair code: {error_code!r}") from exc
+    if error_code == "action_index_out_of_range":
+        if type(valid_action_count) is not int or valid_action_count < 1:
+            raise ValueError("valid_action_count must be a positive integer")
+        diagnosis = diagnosis.format(max_index=valid_action_count - 1)
+    expected_format = '{"speech":"..."}' if is_speech else '{"action_index":0}'
+    return GAMEPLAY_REPAIR_TEMPLATE.format(
+        diagnosis=diagnosis,
+        requirements=GAMEPLAY_JSON_REQUIREMENTS,
+        expected_format=expected_format,
+    )
 
 
 BELIEF_SYSTEM_PROMPT = """你正在私下测量一名玩家在当前检查点的主观身份信念。
@@ -580,6 +628,8 @@ _GAMEPLAY_STABLE_PROTOCOL = {
         "night": NIGHT_TASK_TEMPLATE,
         "action": ACTION_TASK_TEMPLATE,
     },
+    "json_requirements": GAMEPLAY_JSON_REQUIREMENTS,
+    "repair_reasons": GAMEPLAY_REPAIR_REASONS,
     "repair_template": GAMEPLAY_REPAIR_TEMPLATE,
     "ruleset": _RULESET_REFERENCE,
 }

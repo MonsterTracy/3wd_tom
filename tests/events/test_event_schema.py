@@ -46,6 +46,40 @@ def test_environment_events_have_fixed_schema_and_visibility():
     assert visible_events([public, private], 4) == [public]
 
 
+@pytest.mark.parametrize("source_span", ["", "   ", "explicit speech"])
+def test_raw_speech_preserves_any_string_source_span(source_span):
+    event = speech_event(
+        event_id="speech",
+        utterance_id="speech",
+        day=1,
+        phase="1_day_speech",
+        turn=1,
+        speaker=1,
+        target=1,
+        value=None,
+        source_span=source_span,
+    )
+
+    assert event["source_span"] == source_span
+    assert validate_event(event)
+
+
+@pytest.mark.parametrize("source_span", [None, 7])
+def test_raw_speech_rejects_missing_or_non_text_source_span(source_span):
+    with pytest.raises(ValueError, match="SPEECH keeps its raw text"):
+        speech_event(
+            event_id="speech",
+            utterance_id="speech",
+            day=1,
+            phase="1_day_speech",
+            turn=1,
+            speaker=1,
+            target=1,
+            value=None,
+            source_span=source_span,
+        )
+
+
 def test_event_schema_rejects_extra_fields_and_source_family_mismatch():
     event = setting_event(event_id="e1", day=0, phase="init", turn=1, value=None)
     event["unexpected"] = "old field"

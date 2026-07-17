@@ -293,6 +293,8 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     report = build_audit_report(records, game_ids=["fixture"])
     required = {
         "schema_version", "games", "public_checkpoints", "private_checkpoints",
+        "collection_status", "completed_games", "runtime_failure_count",
+        "failed_game_id", "runtime_error_type", "runtime_error_message",
         "unique_belief_elicitations", "successful_guesses", "failed_guesses",
         "repair_attempts", "first_order_samples", "second_order_public_samples",
         "belief_failure_reason_distribution", "belief_first_attempt_successes",
@@ -330,6 +332,13 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         "missing_ruleset_count", "invalid_ruleset_count",
     }
     assert required <= set(report)
+    assert report["schema_version"] == "tom.audit.v1_4"
+    assert report["collection_status"] == "complete"
+    assert report["completed_games"] == 1
+    assert report["runtime_failure_count"] == 0
+    assert report["failed_game_id"] is None
+    assert report["runtime_error_type"] is None
+    assert report["runtime_error_message"] is None
     assert report["games"] == 1
     assert report["public_checkpoints"] == 1
     assert report["unique_belief_elicitations"] == 1
@@ -355,7 +364,7 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["prompt_protocol_distribution"] == {
         records[0]["prompt_protocol"]["protocol_id"]: 2
     }
-    assert report["gameplay_prompt_versions"] == ["gameplay.zh.v2"]
+    assert report["gameplay_prompt_versions"] == ["gameplay.zh.v3"]
     assert report["belief_prompt_versions"] == ["belief.zh.v3"]
     assert report["parser_prompt_versions"] == ["parser.zh.v3"]
     assert report["ruleset_ids"] == ["werewolf_7p"]
@@ -370,6 +379,19 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["speech_event_count"] == 0
     assert report["parser_call_count"] == 0
     assert assert_audit_passes(report)
+
+    failed_report = build_audit_report(
+        records,
+        game_ids=["fixture"],
+        collection_status="failed",
+        completed_games=0,
+        failed_game_id="fixture",
+        runtime_error_type="RuntimeError",
+        runtime_error_message="gameplay action generation failed: invalid_json",
+    )
+    assert failed_report["runtime_failure_count"] == 1
+    with pytest.raises(RuntimeError, match="collection_status"):
+        assert_audit_passes(failed_report)
 
     duplicate_report = build_audit_report(records + [deepcopy(records[0])])
     assert duplicate_report["duplicate_sample_ids"] == 1
@@ -455,8 +477,8 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     )
     mixed_protocol_report = build_audit_report(mixed_protocol)
     assert len(mixed_protocol_report["prompt_protocol_ids"]) == 2
-    assert mixed_protocol_report["invalid_prompt_protocol_count"] == 0
-    with pytest.raises(RuntimeError, match="prompt_protocol_ids"):
+    assert mixed_protocol_report["invalid_prompt_protocol_count"] == 1
+    with pytest.raises(RuntimeError, match="prompt_protocol_ids|invalid_prompt_protocol"):
         assert_audit_passes(mixed_protocol_report)
 
 

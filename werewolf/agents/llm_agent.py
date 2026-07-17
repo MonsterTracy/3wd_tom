@@ -1,7 +1,6 @@
 """LLM agent that consumes only unified structured events."""
 
 import json
-import random
 from pathlib import Path
 
 from werewolf.agents.base_agent import Agent
@@ -22,6 +21,23 @@ from werewolf.prompt_protocol import (
 from werewolf.tom.guess_provider import BeliefGuessProvider
 
 
+GAMEPLAY_VALIDATION_ERROR_CODES = {
+    "invalid_json",
+    "wrong_fields",
+    "speech_not_text",
+    "action_index_not_integer",
+    "action_index_out_of_range",
+}
+
+
+class GameplayValidationError(ValueError):
+    def __init__(self, code, message):
+        if code not in GAMEPLAY_VALIDATION_ERROR_CODES:
+            raise ValueError(f"unknown gameplay validation error code: {code!r}")
+        super().__init__(message)
+        self.code = code
+
+
 class LLMAgent(Agent):
     def __init__(
         self,
@@ -32,12 +48,11 @@ class LLMAgent(Agent):
         log_file=None,
         seed=None,
     ):
-        del tokenizer
+        del tokenizer, seed
         self.backend = backend
         self.model_name = model_name
         self.temperature = temperature
         self.log_file = Path(log_file) if log_file else None
-        self.rng = random.Random(seed)
 
     def _chat(self, messages, **kwargs):
         if self.backend is None or not self.model_name:
@@ -105,30 +120,36 @@ class LLMAgent(Agent):
     def _parse_response(text, observation):
         try:
             payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"response is not valid JSON: {exc.msg}") from exc
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise GameplayValidationError(
+                "invalid_json", "response is not valid JSON"
+            ) from exc
         if "speech" in observation["phase"]:
             if not isinstance(payload, dict) or set(payload) != {"speech"}:
-                raise ValueError("speech response must contain only speech")
+                raise GameplayValidationError(
+                    "wrong_fields", "speech response must contain only speech"
+                )
             if not isinstance(payload["speech"], str):
-                raise ValueError("speech must be text")
+                raise GameplayValidationError(
+                    "speech_not_text", "speech must be text"
+                )
             action_type = "speech_pk" if "speech_pk" in observation["phase"] else "speech"
             return action_type, payload["speech"]
         if not isinstance(payload, dict) or set(payload) != {"action_index"}:
-            raise ValueError("action response must contain only action_index")
+            raise GameplayValidationError(
+                "wrong_fields", "action response must contain only action_index"
+            )
         index = payload["action_index"]
         actions = observation["valid_actions"]
-        if type(index) is not int or not 0 <= index < len(actions):
-            raise ValueError("action_index is outside valid_actions")
+        if type(index) is not int:
+            raise GameplayValidationError(
+                "action_index_not_integer", "action_index must be an integer"
+            )
+        if not 0 <= index < len(actions):
+            raise GameplayValidationError(
+                "action_index_out_of_range", "action_index is outside valid_actions"
+            )
         return tuple(actions[index])
-
-    def _fallback(self, observation):
-        if "speech" in observation["phase"]:
-            action_type = "speech_pk" if "speech_pk" in observation["phase"] else "speech"
-            return action_type, ""
-        actions = observation["valid_actions"]
-        non_abstain = [action for action in actions if action[1] != 0]
-        return self.rng.choice(non_abstain or actions)
 
     def _write_log(self, record):
         if self.log_file is None:
@@ -140,18 +161,25 @@ class LLMAgent(Agent):
     def act(self, observation):
         responses = []
         error = None
+        error_code = None
+        first_error_code = None
         action = None
         attempts = 0
-        messages = self.build_messages(observation)
+        initial_messages = self.build_messages(observation)
         for attempt in range(1, 3):
             attempts = attempt
-            if attempt == 2:
+            messages = [dict(message) for message in initial_messages]
+            if attempt == 2 and first_error_code != "backend_error":
                 messages.extend(
                     [
-                        {"role": "assistant", "content": responses[-1] if responses else ""},
+                        {"role": "assistant", "content": responses[-1]},
                         {
                             "role": "user",
-                            "content": gameplay_repair_message(),
+                            "content": gameplay_repair_message(
+                                first_error_code,
+                                phase=observation["phase"],
+                                valid_action_count=len(observation["valid_actions"]),
+                            ),
                         },
                     ]
                 )
@@ -164,11 +192,30 @@ class LLMAgent(Agent):
                 responses.append(response if isinstance(response, str) else str(response))
                 action = self._parse_response(responses[-1], observation)
                 error = None
+                error_code = None
                 break
-            except Exception as exc:
+            except GameplayValidationError as exc:
+                error_code = exc.code
                 error = f"{type(exc).__name__}: {exc}"
-        if action is None:
-            action = self._fallback(observation)
+            except BackendError as exc:
+                error_code = "backend_error"
+                error = f"{type(exc).__name__}: {exc}"
+                if attempt == 1 and not exc.retryable:
+                    first_error_code = error_code
+                    break
+            except Exception as exc:
+                backend_error = BackendError(
+                    "Gameplay backend raised an unexpected exception.",
+                    retryable=False,
+                    details={"cause_type": type(exc).__name__},
+                )
+                error_code = "backend_error"
+                error = f"{type(backend_error).__name__}: {backend_error}"
+                if attempt == 1:
+                    first_error_code = error_code
+                    break
+            if attempt == 1:
+                first_error_code = error_code
         self._write_log(
             {
                 "player_id": observation["player_id"],
@@ -180,7 +227,12 @@ class LLMAgent(Agent):
                 "attempts": attempts,
                 "responses": responses,
                 "error": error,
-                "action": list(action),
+                "error_code": error_code,
+                "action": list(action) if action is not None else None,
             }
         )
+        if action is None:
+            raise RuntimeError(
+                f"gameplay action generation failed: {error_code or 'backend_error'}"
+            )
         return action

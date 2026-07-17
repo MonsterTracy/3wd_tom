@@ -303,7 +303,10 @@ def validate_event(event: dict) -> bool:
         raise ValueError("content kind/value must already be canonical")
     if content["kind"] not in CONTENT_KINDS_BY_FAMILY[event["event_family"]]:
         raise ValueError("content.kind is not valid for its event_family")
-    if content["kind"] == "SPEECH" and not event["source_span"]:
+    if content["kind"] == "SPEECH" and (
+        event["source_span"] is None
+        or not isinstance(event["source_span"], str)
+    ):
         raise ValueError("SPEECH keeps its raw text in source_span")
     if content["kind"] == "WOLF_TEAM" and len(event["target"]) != 2:
         raise ValueError("WOLF_TEAM requires the two wolf ids in target")
