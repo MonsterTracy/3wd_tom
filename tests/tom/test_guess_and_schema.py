@@ -36,6 +36,7 @@ from werewolf.prompt_protocol import (
     PROMPT_PROTOCOL_VERSION,
     build_gameplay_system_prompt,
     build_prompt_protocol,
+    gameplay_action_options,
     make_prompt_spec,
     normalize_prompt_text,
     prompt_sha256,
@@ -114,10 +115,10 @@ def _elicit(provider, *, player_view="view", required=(), forbidden=(3,), mask=N
 
 
 def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
-    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v5"
+    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v6"
     assert PROMPT_LANGUAGE == "zh-CN"
     expected_versions = {
-        "gameplay": "gameplay.zh.v3",
+        "gameplay": "gameplay.zh.v4",
         "belief": "belief.zh.v3",
         "parser": "parser.zh.v3",
     }
@@ -138,7 +139,7 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
     changed = dict(CANONICAL_PROMPT_SPECS)
     changed["gameplay"] = make_prompt_spec(
         name="gameplay",
-        version="gameplay.zh.v3",
+        version="gameplay.zh.v4",
         text=GAMEPLAY_PROMPT_SPEC["text"] + "\n变更。",
     )
     assert protocol_id_from_specs(changed) != first
@@ -148,7 +149,7 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
         "sha256": "7d45ee4a8957001b6c2ea44c3b9ec9afba99fe1235ad07147d6c6c1ccd9a6bc1",
     }
     assert GAMEPLAY_PROMPT_SPEC["sha256"] == (
-        "c934af55236f82b2a4951b349c36711111e7c400be243076b9a6f59f875ecf4a"
+        "6f92bd7e27e2c683758fdd69557176e802c99d6831b862d9d304e1c088217e09"
     )
     assert PARSER_PROMPT_SPEC["sha256"] == (
         "0e8d205bc640273c450a10d6760076e6db3fab4547796476d5fa59a0f31732a4"
@@ -163,7 +164,7 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
         "sha256:532d1d603ccde38d3195589a28e230dfe8d2827252e36f39486888d185512b34"
     )
     assert first == (
-        "sha256:07a6d57ed4d79a046a42238291ac12c7de9b7f83c16f3b42e046c8f3d76515d9"
+        "sha256:c6452690112c6f6d2806fedf8ba485b2aaf6226f2897a4be08c52ffbe4edec63"
     )
     assert '{"wolf_pair":[1,2]}' in json.loads(
         BELIEF_PROMPT_SPEC["text"]
@@ -175,6 +176,112 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
     assert CONTENT_VALUES_BY_KIND["ROLE"] == (
         "Werewolf", "Seer", "Witch", "Guard", "Villager"
     )
+
+
+def test_gameplay_action_options_preserve_order_and_separate_player_ids():
+    actions = (
+        ("vote", 0),
+        ("vote", 2),
+        ("vote", 7),
+    )
+    assert gameplay_action_options(actions) == [
+        {"option_index": 0, "action": "vote", "target_player": None},
+        {"option_index": 1, "action": "vote", "target_player": 2},
+        {"option_index": 2, "action": "vote", "target_player": 7},
+    ]
+    assert gameplay_action_options((("witch_pass", 0),)) == [
+        {
+            "option_index": 0,
+            "action": "witch_pass",
+            "target_player": None,
+        }
+    ]
+    assert gameplay_action_options(
+        (("witch_pass", 0), ("witch_poison", 6))
+    ) == [
+        {
+            "option_index": 0,
+            "action": "witch_pass",
+            "target_player": None,
+        },
+        {
+            "option_index": 1,
+            "action": "witch_poison",
+            "target_player": 6,
+        },
+    ]
+    assert gameplay_action_options(
+        (("check", 3), ("check", 5), ("check", 7))
+    )[-1] == {
+        "option_index": 2,
+        "action": "check",
+        "target_player": 7,
+    }
+    assert gameplay_action_options((("guard", 0), ("guard", 4))) == [
+        {"option_index": 0, "action": "guard", "target_player": None},
+        {"option_index": 1, "action": "guard", "target_player": 4},
+    ]
+    assert gameplay_action_options((("vote", 2), ("vote", 7))) == [
+        {"option_index": 0, "action": "vote", "target_player": 2},
+        {"option_index": 1, "action": "vote", "target_player": 7},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("actions", "invalid_index", "expected_range"),
+    [
+        ((("witch_pass", 0),), 1, "0 到 0"),
+        ((("check", 0), ("check", 3), ("check", 5)), 7, "0 到 2"),
+        ((("vote", 0), ("vote", 2), ("vote", 7)), 7, "0 到 2"),
+    ],
+)
+def test_gameplay_validation_and_repair_track_dynamic_action_count(
+    actions, invalid_index, expected_range
+):
+    observation = {"phase": "skill", "valid_actions": list(actions)}
+    assert LLMAgent._parse_response(
+        '{"action_index":0}', observation
+    ) == actions[0]
+    with pytest.raises(GameplayValidationError) as captured:
+        LLMAgent._parse_response(
+            json.dumps({"action_index": invalid_index}), observation
+        )
+    assert captured.value.code == "action_index_out_of_range"
+    repair = gameplay_repair_message(
+        captured.value.code,
+        phase=observation["phase"],
+        valid_action_options=gameplay_action_options(actions),
+        invalid_action_index=captured.value.invalid_action_index,
+    )
+    assert f"当前合法 option_index 范围是 {expected_range}" in repair
+    assert json.dumps(
+        gameplay_action_options(actions), ensure_ascii=False, indent=2
+    ) in repair
+
+
+def test_gameplay_prompt_renders_complete_zero_based_option_mapping():
+    actions = tuple(("vote", player_id) for player_id in range(2, 8))
+    agent = LLMAgent(backend=SequenceBackend([]), model_name="gameplay-model")
+    observation = {
+        "player_id": 1,
+        "role": "Witch",
+        "phase": "2_day_vote",
+        "valid_actions": list(actions),
+        "alive_players": list(range(1, 8)),
+        "events": [],
+    }
+    prompt = agent.build_messages(observation)[1]["content"]
+    expected_mapping = gameplay_action_options(actions)
+    assert json.dumps(expected_mapping, ensure_ascii=False, indent=2) in prompt
+    assert expected_mapping[0]["option_index"] == 0
+    assert expected_mapping[-1] == {
+        "option_index": 5,
+        "action": "vote",
+        "target_player": 7,
+    }
+    assert "action_index 表示上方可选动作中的 option_index，不是玩家编号" in prompt
+    assert '{"action_index":5}' in prompt
+    assert "不得把玩家编号直接作为 action_index" in prompt
 
 
 def test_gameplay_prompt_separates_trusted_rules_from_dynamic_player_view(tmp_path):
@@ -302,14 +409,83 @@ def test_gameplay_response_classifies_validation_errors(
 def test_gameplay_repair_is_programmatic_and_stage_specific(
     error_code, phase, expected
 ):
+    options = gameplay_action_options((("vote", 2), ("vote", 7)))
     repair = gameplay_repair_message(
-        error_code, phase=phase, valid_action_count=2
+        error_code,
+        phase=phase,
+        valid_action_options=options,
+        invalid_action_index=7 if error_code == "action_index_out_of_range" else None,
     )
     assert expected in repair
     assert '半角英文双引号 "' in repair
     assert "中文引号“”" in repair
     assert "Markdown" in repair
     assert "额外字段" in repair
+    if error_code == "action_index_out_of_range":
+        assert '{"action_index":7}' in repair
+        assert '"option_index": 1' in repair
+        assert '"target_player": 7' in repair
+        assert "玩家编号" in repair
+        assert '{"action_index":1}' in repair
+
+
+def test_gameplay_repairs_player_id_confusion_with_one_action_snapshot(tmp_path):
+    actions = [("vote", player_id) for player_id in range(2, 8)]
+    observation = {
+        "player_id": 1,
+        "role": "Witch",
+        "phase": "2_day_vote",
+        "valid_actions": actions,
+        "alive_players": list(range(1, 8)),
+        "events": [],
+    }
+
+    class MutatingBackend:
+        def __init__(self):
+            self.calls = 0
+            self.messages = []
+
+        def chat(self, messages, **_kwargs):
+            self.calls += 1
+            self.messages.append(deepcopy(messages))
+            if self.calls == 1:
+                observation["valid_actions"][:] = [("vote", 2)]
+                return '{"action_index":7}'
+            return '{"action_index":5}'
+
+    backend = MutatingBackend()
+    log_file = tmp_path / "agent.jsonl"
+    agent = LLMAgent(
+        backend=backend, model_name="gameplay-model", log_file=log_file
+    )
+
+    assert agent.act(observation) == ("vote", 7)
+    assert backend.calls == 2
+    assert backend.messages[1][2] == {
+        "role": "assistant",
+        "content": '{"action_index":7}',
+    }
+    initial_prompt = backend.messages[0][1]["content"]
+    repair = backend.messages[1][3]["content"]
+    assert '"option_index": 5' in initial_prompt
+    assert '"target_player": 7' in initial_prompt
+    assert '"option_index": 5' in repair
+    assert '"target_player": 7' in repair
+    assert "当前合法 option_index 范围是 0 到 5" in repair
+    assert "`7` 可能是你想选择的玩家编号" in repair
+    assert '{"action_index":5}' in repair
+
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    assert record["attempts"] == 2
+    assert record["responses"] == [
+        '{"action_index":7}',
+        '{"action_index":5}',
+    ]
+    assert record["error_code"] is None
+    assert record["action"] == ["vote", 7]
+    assert record["valid_action_options"] == gameplay_action_options(
+        tuple(("vote", player_id) for player_id in range(2, 8))
+    )
 
 
 def test_gameplay_retries_retryable_backend_with_identical_initial_messages():
@@ -355,17 +531,18 @@ def test_gameplay_nonretryable_backend_fails_once_without_repair(tmp_path):
     assert record["action"] is None
 
 
-def test_gameplay_two_semantic_failures_log_and_raise_without_fallback(tmp_path):
-    backend = SequenceBackend(['{“action_index”:0}', '{"action_index":9}'])
+def test_gameplay_two_out_of_range_player_ids_log_and_raise_without_fallback(tmp_path):
+    backend = SequenceBackend(['{"action_index":7}', '{"action_index":7}'])
     log_file = tmp_path / "agent.jsonl"
     agent = LLMAgent(
         backend=backend, model_name="gameplay-model", log_file=log_file
     )
     observation = {
         "player_id": 1,
-        "role": "Villager",
-        "phase": "skill_wolf",
-        "valid_actions": [("kill", 0), ("kill", 2)],
+        "role": "Witch",
+        "phase": "2_day_vote",
+        "valid_actions": [("vote", player_id) for player_id in range(2, 8)],
+        "alive_players": list(range(1, 8)),
         "events": [],
     }
 
@@ -373,13 +550,18 @@ def test_gameplay_two_semantic_failures_log_and_raise_without_fallback(tmp_path)
         agent.act(observation)
     assert backend.calls == 2
     assert backend.messages[1][2] == {
-        "role": "assistant", "content": '{“action_index”:0}'
+        "role": "assistant", "content": '{"action_index":7}'
     }
     assert not hasattr(LLMAgent, "_fallback")
     record = json.loads(log_file.read_text(encoding="utf-8"))
-    assert record["responses"] == ['{“action_index”:0}', '{"action_index":9}']
+    assert record["responses"] == ['{"action_index":7}', '{"action_index":7}']
     assert record["error_code"] == "action_index_out_of_range"
     assert record["action"] is None
+    assert record["valid_action_options"][-1] == {
+        "option_index": 5,
+        "action": "vote",
+        "target_player": 7,
+    }
 
 
 def test_gameplay_and_belief_views_partition_facts_events_and_claims_once():
@@ -486,8 +668,10 @@ def test_prompt_hash_payload_covers_all_stable_templates_and_ruleset():
     )
     assert '{"speech":"..."}' in speech_task
     assert "action_index" not in speech_task
-    assert '{"action_index":0}' in vote_task
-    assert '{"action_index":0}' in night_task
+    assert '{"action_index":<option_index>}' in vote_task
+    assert '{"action_index":<option_index>}' in night_task
+    assert "action_index 必须是严格整数" in vote_task
+    assert "action_index 必须是严格整数" in night_task
     assert "pass 只能在环境允许时选择" in night_task
     for task in (speech_task, vote_task, night_task):
         assert "小写 ASCII json" in task
@@ -895,6 +1079,21 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
     assert record["prompt_protocol"]["protocol_id"] == protocol_id_from_specs(
         CANONICAL_PROMPT_SPECS
     )
+
+    old_gameplay_v3 = deepcopy(record)
+    old_gameplay_v3["prompt_protocol"]["gameplay"] = {
+        "version": "gameplay.zh.v3",
+        "sha256": "c934af55236f82b2a4951b349c36711111e7c400be243076b9a6f59f875ecf4a",
+    }
+    old_v3_references = {
+        name: old_gameplay_v3["prompt_protocol"][name]
+        for name in ("gameplay", "belief", "parser")
+    }
+    old_gameplay_v3["prompt_protocol"]["protocol_id"] = (
+        protocol_id_from_references(old_v3_references)
+    )
+    with pytest.raises(ValueError, match="gameplay.*canonical prompt"):
+        validate_sample(old_gameplay_v3)
 
     old_gameplay_v2 = deepcopy(record)
     old_gameplay_v2["prompt_protocol"]["gameplay"] = {

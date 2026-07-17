@@ -431,7 +431,7 @@ class EmptySpeechFakeBackend(DeterministicFakeBackend):
             if '{"speech":"..."}' in prompt:
                 return '{"speech":""}'
             match = re.search(
-                r"【当前合法动作】\n(\[.*?\])\n\n【当前阶段任务】",
+                r"【当前合法动作】\n(\[.*?\])\n\n【动作下标说明】",
                 prompt,
                 re.DOTALL,
             )
@@ -446,6 +446,64 @@ class InvalidGameplayFakeBackend(DeterministicFakeBackend):
         if system not in {PARSER_SYSTEM_PROMPT, BELIEF_SYSTEM_PROMPT}:
             return '{“action_index”:0}'
         return super().chat(messages, **kwargs)
+
+
+class PlayerIdConfusionFakeBackend(DeterministicFakeBackend):
+    def __init__(self, *, repair_succeeds):
+        super().__init__()
+        self.repair_succeeds = repair_succeeds
+        self.awaiting_repair = False
+        self.corrected_index = None
+
+    @staticmethod
+    def _options(prompt):
+        match = re.search(
+            r"【当前合法动作】\n(\[.*?\])\n\n【动作下标说明】",
+            prompt,
+            re.DOTALL,
+        )
+        return json.loads(match.group(1))
+
+    @staticmethod
+    def _index_for_target(options, target_player):
+        return next(
+            option["option_index"]
+            for option in options
+            if option["target_player"] == target_player
+        )
+
+    def chat(self, messages, **kwargs):
+        system = messages[0]["content"] if messages[0]["role"] == "system" else ""
+        if system in {PARSER_SYSTEM_PROMPT, BELIEF_SYSTEM_PROMPT}:
+            return super().chat(messages, **kwargs)
+        if self.awaiting_repair and len(messages) == 4:
+            self.awaiting_repair = False
+            if not self.repair_succeeds:
+                return '{"action_index":7}'
+            return json.dumps({"action_index": self.corrected_index})
+        prompt = messages[1]["content"]
+        if '{"speech":"..."}' in prompt:
+            return '{"speech":"确定性发言"}'
+        options = self._options(prompt)
+        phase = re.search(r"当前阶段：([^\n]+)", prompt).group(1)
+        player_id = int(re.search(r"玩家编号：(\d+)", prompt).group(1))
+        if phase == "2_day_vote" and player_id == 1:
+            self.corrected_index = self._index_for_target(options, 7)
+            self.awaiting_repair = True
+            return '{"action_index":7}'
+        if "vote" in phase:
+            target = (
+                6
+                if phase == "1_day_vote"
+                else (7 if phase == "2_day_vote" else 5)
+            )
+            return json.dumps(
+                {"action_index": self._index_for_target(options, target)}
+            )
+        no_target = next(
+            option for option in options if option["target_player"] is None
+        )
+        return json.dumps({"action_index": no_target["option_index"]})
 
 
 def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_path):
@@ -600,13 +658,14 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert log_records
     assert all(
         record["gameplay_prompt"] == {
-            "version": "gameplay.zh.v3",
+            "version": "gameplay.zh.v4",
             "sha256": GAMEPLAY_PROMPT_SPEC["sha256"],
         }
         and record["model"] == "deepseek-chat"
         and record["temperature"] == 0.7
         and record["attempts"] in (1, 2)
         and "action" in record
+        and "valid_action_options" in record
         for record in log_records
     )
     assert "DEEPSEEK_API_KEY" not in json.dumps(samples)
@@ -687,6 +746,86 @@ def test_one_fake_game_preserves_explicit_empty_speech_and_completes_audit(tmp_p
         for sample in samples
         for event in sample["events"]
     )
+
+
+def test_fake_player_id_confusion_repairs_to_option_index_and_completes(tmp_path):
+    config = _config()
+    backend = PlayerIdConfusionFakeBackend(repair_succeeds=True)
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
+
+    result = collect_from_config(
+        config,
+        games=1,
+        run_id="game_005",
+        data_dir=data_root,
+        log_dir=log_root,
+        backends={"deepseek": backend},
+        env={"DEEPSEEK_API_KEY": "fake-for-test"},
+    )
+
+    assert result["audit"]["collection_status"] == "complete"
+    assert result["audit"]["runtime_failure_count"] == 0
+    player_log = log_root / "game_005" / "game_005.player_1.jsonl"
+    records = [
+        json.loads(line)
+        for line in player_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    repaired = next(record for record in records if record["phase"] == "2_day_vote")
+    target_option = next(
+        option
+        for option in repaired["valid_action_options"]
+        if option["target_player"] == 7
+    )
+    assert target_option["option_index"] != 7
+    assert repaired["attempts"] == 2
+    assert repaired["responses"] == [
+        '{"action_index":7}',
+        json.dumps({"action_index": target_option["option_index"]}),
+    ]
+    assert repaired["error_code"] is None
+    assert repaired["action"] == ["vote", 7]
+    assert len(ToMDataset(result["samples_path"])) > 0
+
+
+def test_fake_repeated_player_id_confusion_keeps_partial_failure(tmp_path):
+    config = _config()
+    backend = PlayerIdConfusionFakeBackend(repair_succeeds=False)
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
+
+    with pytest.raises(RuntimeError, match="action_index_out_of_range"):
+        collect_from_config(
+            config,
+            games=1,
+            run_id="game_006",
+            data_dir=data_root,
+            log_dir=log_root,
+            backends={"deepseek": backend},
+            env={"DEEPSEEK_API_KEY": "fake-for-test"},
+        )
+
+    data_run_dir = data_root / "game_006"
+    audit = json.loads(
+        (data_run_dir / "game_006.audit.json").read_text(encoding="utf-8")
+    )
+    assert audit["collection_status"] == "failed"
+    assert audit["runtime_failure_count"] == 1
+    assert audit["failed_game_id"] == "game_006"
+    player_log = log_root / "game_006" / "game_006.player_1.jsonl"
+    records = [
+        json.loads(line)
+        for line in player_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failed = next(record for record in records if record["phase"] == "2_day_vote")
+    assert failed["attempts"] == 2
+    assert failed["responses"] == ['{"action_index":7}', '{"action_index":7}']
+    assert failed["error_code"] == "action_index_out_of_range"
+    assert failed["action"] is None
+    with pytest.raises(ValueError, match="failed collection audit"):
+        ToMDataset(data_run_dir / "game_006.samples.jsonl")
 
 
 def test_gameplay_failure_writes_partial_audit_and_is_not_trainable(tmp_path):

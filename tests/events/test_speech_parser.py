@@ -184,7 +184,7 @@ def test_parser_backend_error_boundary_does_not_change_prompt_protocol():
         "text": PARSER_PROMPT_SPEC["text"],
     }
     assert protocol_id_from_specs(CANONICAL_PROMPT_SPECS) == (
-        "sha256:07a6d57ed4d79a046a42238291ac12c7de9b7f83c16f3b42e046c8f3d76515d9"
+        "sha256:c6452690112c6f6d2806fedf8ba485b2aaf6226f2897a4be08c52ffbe4edec63"
     )
 
 

@@ -13,6 +13,7 @@ from werewolf.game_rules import variant_from_role_counts
 from werewolf.prompt_protocol import (
     GAMEPLAY_PROMPT_SPEC,
     build_gameplay_system_prompt,
+    gameplay_action_options,
     gameplay_repair_message,
     prompt_reference,
     render_gameplay_phase_task,
@@ -31,11 +32,12 @@ GAMEPLAY_VALIDATION_ERROR_CODES = {
 
 
 class GameplayValidationError(ValueError):
-    def __init__(self, code, message):
+    def __init__(self, code, message, *, invalid_action_index=None):
         if code not in GAMEPLAY_VALIDATION_ERROR_CODES:
             raise ValueError(f"unknown gameplay validation error code: {code!r}")
         super().__init__(message)
         self.code = code
+        self.invalid_action_index = invalid_action_index
 
 
 class LLMAgent(Agent):
@@ -78,7 +80,13 @@ class LLMAgent(Agent):
             return "seer_guard"
         return "seer_witch"
 
-    def format_observation(self, observation):
+    def format_observation(
+        self,
+        observation,
+        *,
+        valid_actions_snapshot=None,
+        valid_action_options=None,
+    ):
         phase = observation["phase"]
         role = observation["role"]
         player_id = observation["player_id"]
@@ -93,6 +101,14 @@ class LLMAgent(Agent):
         information = render_information_partitions(
             observation["events"], player_id=player_id
         )
+        if valid_actions_snapshot is None:
+            valid_actions_snapshot = tuple(
+                tuple(action) for action in observation["valid_actions"]
+            )
+        if valid_action_options is None:
+            valid_action_options = gameplay_action_options(
+                valid_actions_snapshot
+            )
         return render_gameplay_user_message(
             player_id=player_id,
             role=role,
@@ -100,11 +116,17 @@ class LLMAgent(Agent):
             day=day,
             alive_players=alive_players,
             information=information,
-            valid_actions=observation["valid_actions"],
+            valid_action_options=valid_action_options,
             phase_task=render_gameplay_phase_task(role, phase, variant),
         )
 
-    def build_messages(self, observation):
+    def build_messages(
+        self,
+        observation,
+        *,
+        valid_actions_snapshot=None,
+        valid_action_options=None,
+    ):
         variant = self._variant(observation)
         return [
             {
@@ -113,11 +135,18 @@ class LLMAgent(Agent):
                     observation["role"], variant
                 ),
             },
-            {"role": "user", "content": self.format_observation(observation)},
+            {
+                "role": "user",
+                "content": self.format_observation(
+                    observation,
+                    valid_actions_snapshot=valid_actions_snapshot,
+                    valid_action_options=valid_action_options,
+                ),
+            },
         ]
 
     @staticmethod
-    def _parse_response(text, observation):
+    def _parse_response(text, observation, *, valid_actions_snapshot=None):
         try:
             payload = json.loads(text)
         except (json.JSONDecodeError, TypeError) as exc:
@@ -140,14 +169,20 @@ class LLMAgent(Agent):
                 "wrong_fields", "action response must contain only action_index"
             )
         index = payload["action_index"]
-        actions = observation["valid_actions"]
+        actions = (
+            tuple(tuple(action) for action in observation["valid_actions"])
+            if valid_actions_snapshot is None
+            else valid_actions_snapshot
+        )
         if type(index) is not int:
             raise GameplayValidationError(
                 "action_index_not_integer", "action_index must be an integer"
             )
         if not 0 <= index < len(actions):
             raise GameplayValidationError(
-                "action_index_out_of_range", "action_index is outside valid_actions"
+                "action_index_out_of_range",
+                "action_index is outside valid_actions",
+                invalid_action_index=index,
             )
         return tuple(actions[index])
 
@@ -163,9 +198,20 @@ class LLMAgent(Agent):
         error = None
         error_code = None
         first_error_code = None
+        first_invalid_action_index = None
         action = None
         attempts = 0
-        initial_messages = self.build_messages(observation)
+        valid_actions_snapshot = tuple(
+            tuple(action) for action in observation["valid_actions"]
+        )
+        valid_action_options = gameplay_action_options(
+            valid_actions_snapshot
+        )
+        initial_messages = self.build_messages(
+            observation,
+            valid_actions_snapshot=valid_actions_snapshot,
+            valid_action_options=valid_action_options,
+        )
         for attempt in range(1, 3):
             attempts = attempt
             messages = [dict(message) for message in initial_messages]
@@ -178,7 +224,8 @@ class LLMAgent(Agent):
                             "content": gameplay_repair_message(
                                 first_error_code,
                                 phase=observation["phase"],
-                                valid_action_count=len(observation["valid_actions"]),
+                                valid_action_options=valid_action_options,
+                                invalid_action_index=first_invalid_action_index,
                             ),
                         },
                     ]
@@ -190,13 +237,19 @@ class LLMAgent(Agent):
                     response_format={"type": "json_object"},
                 )
                 responses.append(response if isinstance(response, str) else str(response))
-                action = self._parse_response(responses[-1], observation)
+                action = self._parse_response(
+                    responses[-1],
+                    observation,
+                    valid_actions_snapshot=valid_actions_snapshot,
+                )
                 error = None
                 error_code = None
                 break
             except GameplayValidationError as exc:
                 error_code = exc.code
                 error = f"{type(exc).__name__}: {exc}"
+                if attempt == 1:
+                    first_invalid_action_index = exc.invalid_action_index
             except BackendError as exc:
                 error_code = "backend_error"
                 error = f"{type(exc).__name__}: {exc}"
@@ -229,6 +282,7 @@ class LLMAgent(Agent):
                 "error": error,
                 "error_code": error_code,
                 "action": list(action) if action is not None else None,
+                "valid_action_options": valid_action_options,
             }
         )
         if action is None:

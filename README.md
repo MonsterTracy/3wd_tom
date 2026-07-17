@@ -111,7 +111,7 @@ for diagnosis, but its audit has `collection_status="failed"` and the Dataset
 loader rejects it for training. Start the retry with a new run ID rather than
 reusing an existing directory. The former dated pilot layout is no longer used.
 
-## Ruleset and Prompt Protocol V5
+## Ruleset and Prompt Protocol V6
 
 `werewolf/game_rules.py` is the sole machine-readable game-rule source. The
 current ruleset is `werewolf_7p.zh.v1` (`id: werewolf_7p`) and covers both
@@ -119,16 +119,18 @@ supported seven-player variants, `seer_witch` and `seer_guard`. Prompt text
 renders rules from that module; this README intentionally does not duplicate
 the complete rules.
 
-`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V5. Its formal
+`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V6. Its formal
 instruction language is Chinese (`language: zh-CN`) and it has three canonical
 protocols:
 
-- `gameplay.zh.v3` layers rendered global rules, current-role rules, visibility
+- `gameplay.zh.v4` layers rendered global rules, current-role rules, visibility
   boundaries, and phase tasks. Its dynamic message separates confirmed private
-  facts, public objective events, and untrusted public player claims. Gameplay
-  output uses strict Python-parseable JSON; backend retries and semantic repair
-  are separate, and invalid actions terminate the rollout instead of falling
-  back to synthetic actions.
+  facts, public objective events, and untrusted public player claims. Every
+  finite action is rendered with a zero-based `option_index`, its action, and
+  its `target_player`; `action_index` selects that option position, not a player
+  ID. Gameplay output uses strict Python-parseable JSON; backend retries and
+  semantic repair are separate, and invalid actions terminate the rollout
+  instead of falling back to synthetic actions.
 - `belief.zh.v3` measures one player's private joint MAP belief over the complete
   two-Werewolf pair from the same three information partitions. Its canonical
   messages include the lowercase `json` instruction required by JSON Output. It

@@ -1,4 +1,4 @@
-"""Canonical Prompt Protocol V5 specifications and stable metadata helpers."""
+"""Canonical Prompt Protocol V6 specifications and stable metadata helpers."""
 
 from copy import deepcopy
 from hashlib import sha256
@@ -16,9 +16,9 @@ from werewolf.game_rules import (
 )
 
 
-PROMPT_PROTOCOL_VERSION = "prompt_protocol.zh.v5"
+PROMPT_PROTOCOL_VERSION = "prompt_protocol.zh.v6"
 PROMPT_LANGUAGE = "zh-CN"
-GAMEPLAY_PROMPT_VERSION = "gameplay.zh.v3"
+GAMEPLAY_PROMPT_VERSION = "gameplay.zh.v4"
 BELIEF_PROMPT_VERSION = "belief.zh.v3"
 PARSER_PROMPT_VERSION = "parser.zh.v3"
 PROMPT_NAMES = ("gameplay", "belief", "parser")
@@ -94,7 +94,10 @@ GAMEPLAY_USER_TEMPLATE = """【当前状态】
 {public_player_claims}
 
 【当前合法动作】
-{valid_actions}
+{valid_action_options}
+
+【动作下标说明】
+{action_index_guidance}
 
 【当前阶段任务】
 {phase_task}"""
@@ -124,9 +127,11 @@ VOTE_TASK_TEMPLATE = """你现在需要执行公开投票。
 请根据当前合法视角和公开讨论，从合法动作列表中选择一个动作。
 不得选择列表外动作。
 不得因为内部真实身份信息而使用当前玩家不可知的信息。
+action_index 必须等于所选动作的 option_index，不是 target_player 玩家编号。
+action_index 必须是严格整数。
 
 只返回：
-{"action_index":0}"""
+{"action_index":<option_index>}"""
 
 NIGHT_TASK_TEMPLATE = """你现在需要执行夜间技能。
 
@@ -134,15 +139,19 @@ NIGHT_TASK_TEMPLATE = """你现在需要执行夜间技能。
 2. 不自行生成目标编号；
 3. 不编造技能结果；
 4. pass 只能在环境允许时选择。
+5. action_index 必须等于所选动作的 option_index，不是 target_player 玩家编号。
+6. action_index 必须是严格整数。
 
 只返回：
-{"action_index":0}"""
+{"action_index":<option_index>}"""
 
 ACTION_TASK_TEMPLATE = """你现在需要执行当前环境动作。
 只从合法动作列表选择，不得自行生成列表外动作。
+action_index 必须等于所选动作的 option_index，不是 target_player 玩家编号。
+action_index 必须是严格整数。
 
 只返回：
-{"action_index":0}"""
+{"action_index":<option_index>}"""
 
 GAMEPLAY_JSON_REQUIREMENTS = """输出协议：
 1. 只返回合法的小写 ASCII json；
@@ -163,8 +172,12 @@ GAMEPLAY_REPAIR_REASONS = {
     "speech_not_text": "上一条 speech 不是字符串。speech 必须是字符串。",
     "action_index_not_integer": "上一条 action_index 不是严格整数。action_index 必须是整数。",
     "action_index_out_of_range": (
-        "上一条 action_index 超出当前合法动作范围。"
-        "请从 0 到 {max_index} 中选择一个整数。"
+        "上一条返回 {invalid_response}，其中 action_index={invalid_index}。\n"
+        "当前合法 option_index 范围是 0 到 {max_index}。\n"
+        "option_index 是动作列表中的位置，target_player 才是玩家编号；"
+        "action_index 必须选择左侧 option_index，绝对不是 target_player。\n"
+        "当前完整映射为：\n{option_mapping}\n"
+        "{target_hint}"
     ),
 }
 GAMEPLAY_REPAIR_TEMPLATE = """{diagnosis}
@@ -197,8 +210,53 @@ def render_gameplay_phase_task(role: str, phase: str, variant: str) -> str:
     return f"{phase_rules}\n\n{task}\n\n{GAMEPLAY_JSON_REQUIREMENTS}"
 
 
+def gameplay_action_options(valid_actions) -> list[dict]:
+    return [
+        {
+            "option_index": option_index,
+            "action": action,
+            "target_player": (
+                target if type(target) is int and target > 0 else None
+            ),
+        }
+        for option_index, (action, target) in enumerate(valid_actions)
+    ]
+
+
+def _action_index_guidance(phase, valid_action_options):
+    if "speech" in phase:
+        return "发言阶段按当前阶段任务返回 speech，不使用 action_index。"
+    target_example = next(
+        (
+            option
+            for option in reversed(valid_action_options)
+            if option["target_player"] is not None
+            and option["target_player"] != option["option_index"]
+        ),
+        None,
+    )
+    guidance = (
+        "action_index 表示上方可选动作中的 option_index，不是玩家编号；"
+        "target_player 才是玩家编号。"
+    )
+    if target_example is None:
+        return (
+            f"{guidance}\n无目标动作的 target_player 为 null，仍必须返回其左侧 "
+            "option_index。"
+        )
+    option_index = target_example["option_index"]
+    target_player = target_example["target_player"]
+    return (
+        f"{guidance}\n例如，若要选择玩家 {target_player}，应返回 "
+        f'{{"action_index":{option_index}}}，不得把玩家编号直接作为 action_index。\n'
+        "只返回一个合法小写 ASCII json 对象："
+        '{"action_index":<option_index>}。'
+    )
+
+
 def render_gameplay_user_message(
-    *, player_id, role, phase, day, alive_players, information, valid_actions,
+    *, player_id, role, phase, day, alive_players, information,
+    valid_action_options,
     phase_task,
 ) -> str:
     return GAMEPLAY_USER_TEMPLATE.format(
@@ -210,15 +268,25 @@ def render_gameplay_user_message(
         private_facts=information["private_facts"],
         public_game_events=information["public_game_events"],
         public_player_claims=information["public_player_claims"],
-        valid_actions=json.dumps(valid_actions, ensure_ascii=False),
+        valid_action_options=json.dumps(
+            valid_action_options, ensure_ascii=False, indent=2
+        ),
+        action_index_guidance=_action_index_guidance(
+            phase, valid_action_options
+        ),
         phase_task=phase_task,
     )
 
 
 def gameplay_repair_message(
-    error_code: str, *, phase: str, valid_action_count: int
+    error_code: str,
+    *,
+    phase: str,
+    valid_action_options=(),
+    invalid_action_index=None,
 ) -> str:
     is_speech = "speech" in phase
+    expected_format = '{"speech":"..."}' if is_speech else '{"action_index":0}'
     reason_key = error_code
     if error_code == "wrong_fields":
         reason_key = "wrong_fields.speech" if is_speech else "wrong_fields.action"
@@ -227,10 +295,48 @@ def gameplay_repair_message(
     except KeyError as exc:
         raise ValueError(f"unsupported gameplay repair code: {error_code!r}") from exc
     if error_code == "action_index_out_of_range":
-        if type(valid_action_count) is not int or valid_action_count < 1:
-            raise ValueError("valid_action_count must be a positive integer")
-        diagnosis = diagnosis.format(max_index=valid_action_count - 1)
-    expected_format = '{"speech":"..."}' if is_speech else '{"action_index":0}'
+        if not valid_action_options:
+            raise ValueError("valid_action_options must not be empty")
+        if type(invalid_action_index) is not int:
+            raise ValueError("invalid_action_index must be an integer")
+        target_option = next(
+            (
+                option
+                for option in valid_action_options
+                if option["target_player"] == invalid_action_index
+            ),
+            None,
+        )
+        if target_option is None:
+            target_hint = (
+                f"{invalid_action_index} 不是合法 option_index。"
+                "请根据映射重新选择左侧 option_index。"
+            )
+        else:
+            corrected_index = target_option["option_index"]
+            expected_format = json.dumps(
+                {"action_index": corrected_index},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            target_hint = (
+                f"`{invalid_action_index}` 可能是你想选择的玩家编号，但它不是选项下标。\n"
+                f"如果你要选择玩家 {invalid_action_index}，应返回 "
+                f'{{"action_index":{corrected_index}}}。'
+            )
+        diagnosis = diagnosis.format(
+            invalid_response=json.dumps(
+                {"action_index": invalid_action_index},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            invalid_index=invalid_action_index,
+            max_index=len(valid_action_options) - 1,
+            option_mapping=json.dumps(
+                list(valid_action_options), ensure_ascii=False, indent=2
+            ),
+            target_hint=target_hint,
+        )
     return GAMEPLAY_REPAIR_TEMPLATE.format(
         diagnosis=diagnosis,
         requirements=GAMEPLAY_JSON_REQUIREMENTS,
