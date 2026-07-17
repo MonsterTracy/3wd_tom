@@ -1,14 +1,22 @@
 from copy import deepcopy
+from collections import Counter
 import json
+from pathlib import Path
 
 import pytest
 
 from werewolf.events.encoder import encode_event
-from werewolf.events.schema import validate_event
-from werewolf.events.speech_parser import SYSTEM_PROMPT, SpeechEventParser
+from werewolf.events.schema import QUALIFIER_ENUMS, validate_event
+from werewolf.events.speech_parser import (
+    SYSTEM_PROMPT,
+    SpeechEventParser,
+    SpeechParserError,
+    _parse_payload,
+)
 from werewolf.prompt_protocol import (
     PARSER_FEW_SHOTS,
     PARSER_PROMPT_SPEC,
+    PARSER_SYSTEM_PROMPT,
     parser_few_shot_messages,
 )
 
@@ -58,8 +66,8 @@ def test_speech_parser_repairs_once_and_emits_only_local_families():
     assert encode_event(metadata_variant) == encode_event(result.events[0])
     first_messages, _ = backend.calls[0]
     second_messages, _ = backend.calls[1]
-    assert "你的上一条回复不符合 schema" not in first_messages[-1]["content"]
-    assert "你的上一条回复不符合 schema" in second_messages[-1]["content"]
+    assert "上一条 json 不符合 schema" not in first_messages[-1]["content"]
+    assert "上一条 json 不符合 schema" in second_messages[-1]["content"]
 
 
 def test_speech_parser_drops_forbidden_or_unanchored_output():
@@ -100,7 +108,9 @@ def test_speech_parser_treats_utterance_commands_as_untrusted_content():
 
 @pytest.mark.parametrize("example", PARSER_FEW_SHOTS, ids=[
     "role-claim", "seer-check-and-vote", "support-and-suspicion",
-    "retract", "empty", "prompt-injection",
+    "retract", "empty", "prompt-injection", "inferred-beliefs",
+    "public-history", "attention-is-not-vote", "conditional-vote",
+    "explicit-pass",
 ])
 def test_canonical_chinese_few_shots_are_complete_valid_parser_examples(example):
     response = json.dumps(
@@ -239,3 +249,268 @@ def test_speech_parser_normalizes_qualifiers_and_extracts_seer_example():
     )
     assert result.events[2]["qualifier"]["commitment"] == "intend"
     assert {event["utterance_id"] for event in result.events} == {"seer-claim"}
+
+
+@pytest.mark.parametrize(
+    ("field", "alias", "expected"),
+    [
+        ("evidence_source", "inference", "unspecified"),
+        ("evidence_source", "deduction", "unspecified"),
+        ("evidence_source", "public_info", "public_history"),
+        ("evidence_source", "claimed_public_info", "public_history"),
+        ("certainty", "likely", "strong"),
+        ("certainty", "low", "weak"),
+        ("certainty", "medium", "normal"),
+        ("certainty", "high", "strong"),
+    ],
+)
+def test_speech_parser_normalizes_only_registered_qualifier_aliases(
+    field, alias, expected
+):
+    response = json.dumps(
+        {
+            "events": [
+                {
+                    "event_family": "BELIEF_ASSERTION",
+                    "target": [2],
+                    "content": {"kind": "CAMP", "value": "Werewolf"},
+                    "qualifier": {field: alias},
+                    "ref_event_id": None,
+                    "source_span": "2号像狼",
+                    "parser_confidence": 0.8,
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    result = SpeechEventParser(SequenceBackend([response]), "parser").parse(
+        utterance="2号像狼", utterance_id=f"alias-{alias}", day=1,
+        phase="1_day_speech", turn=2, speaker=1,
+    )
+
+    assert result.status == "success"
+    assert result.events[0]["qualifier"][field] == expected
+    assert result.events[0]["source_span"] == "2号像狼"
+    assert result.events[0]["content"] == {"kind": "CAMP", "value": "Werewolf"}
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "allowed_values"),
+    [
+        (
+            "qualifier.evidence_source", "internet",
+            ["public_history", "claimed_private_info", "unspecified"],
+        ),
+        (
+            "qualifier.certainty", "almost_certain",
+            ["weak", "normal", "strong"],
+        ),
+    ],
+)
+def test_unknown_qualifier_values_fail_with_specific_repair_without_guessing(
+    field, invalid_value, allowed_values
+):
+    qualifier_field = field.split(".", 1)[1]
+    response = json.dumps(
+        {
+            "events": [
+                {
+                    "event_family": "BELIEF_ASSERTION",
+                    "target": [2],
+                    "content": {"kind": "CAMP", "value": "Werewolf"},
+                    "qualifier": {qualifier_field: invalid_value},
+                    "ref_event_id": None,
+                    "source_span": "2号像狼",
+                    "parser_confidence": 0.8,
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    backend = SequenceBackend([response, response])
+    result = SpeechEventParser(backend, "parser").parse(
+        utterance="2号像狼", utterance_id="unknown-qualifier", day=1,
+        phase="1_day_speech", turn=2, speaker=1,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "schema_validation"
+    repair = backend.calls[1][0][-1]["content"]
+    assert field in repair
+    assert f'"{invalid_value}"' in repair
+    assert all(value in repair for value in allowed_values)
+    assert "本次应改为" not in repair
+    assert backend.calls[1][0][-2] == {"role": "assistant", "content": response}
+
+
+def test_specific_qualifier_repair_can_succeed_on_second_response():
+    def response(evidence_source):
+        return json.dumps(
+            {
+                "events": [
+                    {
+                        "event_family": "BELIEF_ASSERTION",
+                        "target": [2],
+                        "content": {"kind": "CAMP", "value": "Werewolf"},
+                        "qualifier": {"evidence_source": evidence_source},
+                        "ref_event_id": None,
+                        "source_span": "2号像狼",
+                        "parser_confidence": 0.8,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    first = response("internet")
+    second = response("unspecified")
+    backend = SequenceBackend([first, second])
+    result = SpeechEventParser(backend, "parser").parse(
+        utterance="2号像狼", utterance_id="repaired-qualifier", day=1,
+        phase="1_day_speech", turn=2, speaker=1,
+    )
+
+    assert result.status == "success"
+    assert result.attempts == 2
+    assert result.raw_text == (first, second)
+    assert result.events[0]["qualifier"]["evidence_source"] == "unspecified"
+    repair = backend.calls[1][0][-1]["content"]
+    assert "qualifier.evidence_source" in repair
+    assert '"internet"' in repair
+    assert "public_history、claimed_private_info、unspecified" in repair
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "allowed_values", "suggested_value"),
+    [
+        (
+            "qualifier.evidence_source", "inference",
+            ["public_history", "claimed_private_info", "unspecified"],
+            "unspecified",
+        ),
+        (
+            "qualifier.evidence_source", "public_info",
+            ["public_history", "claimed_private_info", "unspecified"],
+            "public_history",
+        ),
+        (
+            "qualifier.certainty", "likely",
+            ["weak", "normal", "strong"], "strong",
+        ),
+    ],
+)
+def test_speech_parser_error_details_render_registered_suggestion(
+    field, invalid_value, allowed_values, suggested_value
+):
+    error = SpeechParserError(
+        "schema_validation",
+        f"invalid {field}: {invalid_value!r}",
+        field=field,
+        invalid_value=invalid_value,
+        allowed_values=allowed_values,
+        event_index=2,
+        suggested_value=suggested_value,
+    )
+
+    assert error.details == {
+        "field": field,
+        "invalid_value": invalid_value,
+        "allowed_values": allowed_values,
+        "event_index": 2,
+        "suggested_value": suggested_value,
+    }
+    repair = error.repair_message()
+    assert "第 2 个事件" in repair
+    assert field in repair
+    assert f'"{invalid_value}"' in repair
+    assert all(value in repair for value in allowed_values)
+    assert f'本次应改为 "{suggested_value}"' in repair
+
+
+def test_parser_v3_prompt_defines_qualifiers_evidence_certainty_and_actions():
+    prompt = PARSER_SYSTEM_PROMPT
+    for instruction in (
+        "polarity：positive、negative、neutral",
+        "certainty：weak、normal、strong",
+        "stance：negative、neutral、positive",
+        "strength：weak、normal、strong",
+        "commitment：consider、intend、commit",
+        "evidence_source：public_history、claimed_private_info、unspecified",
+        "relation：support、challenge、question、retract",
+        "Speech Parser 不得主动生成 private_fact",
+        "不确定 evidence source 时使用 unspecified 或直接省略",
+        "不得把推理方式当作 evidence_source",
+        "重点关注不能等价为 VOTE",
+        "VOTE 的 target 必须只包含一个玩家",
+        "PASS 的 target 必须为 []",
+    ):
+        assert instruction in prompt
+    for example in (
+        "根据昨天3号的投票，我觉得3号像狼",
+        "昨晚我验了3号，他是狼人",
+        "7号很可能是真预言家",
+        "1号应该是好人",
+        "如果5号解释不清，我考虑投5号",
+        "这一轮我选择弃票",
+    ):
+        assert example in prompt
+    assert "certainty=likely" in prompt
+    assert "evidence_source=inference" in prompt
+
+
+def test_pilot_003_first_parser_responses_recover_all_events_offline():
+    root = Path("data/tom/pilot_20260717_003")
+    failures = json.loads(
+        (root / "logs/game_20260716/parser_failures.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    wanted = {record["utterance_id"] for record in failures}
+    utterances = {}
+    with (root / "samples.jsonl").open(encoding="utf-8") as source:
+        for line in source:
+            if not line.strip():
+                continue
+            sample = json.loads(line)
+            for event in sample["events"]:
+                utterance_id = event.get("utterance_id")
+                if (
+                    utterance_id in wanted
+                    and event.get("content", {}).get("kind") == "SPEECH"
+                ):
+                    utterances.setdefault(utterance_id, event["source_span"])
+
+    recovered = []
+    for record in failures:
+        utterance_id = record["utterance_id"]
+        events = _parse_payload(
+            record["raw_text"][0],
+            utterance=utterances[utterance_id],
+            utterance_id=utterance_id,
+            day=1,
+            phase="1_day_speech",
+            turn=1,
+            speaker=1,
+            parser_metadata={
+                "version": PARSER_PROMPT_SPEC["version"],
+                "sha256": PARSER_PROMPT_SPEC["sha256"],
+                "model": "offline-replay",
+                "temperature": 0.0,
+                "attempts": 1,
+                "status": "ok",
+            },
+        )
+        assert events
+        recovered.extend(events)
+
+    assert len(failures) == 6
+    assert len(utterances) == 6
+    assert len(recovered) == 34
+    assert Counter(event["event_family"] for event in recovered) == {
+        "ACTION_POSITION": 8,
+        "BELIEF_ASSERTION": 14,
+        "SOCIAL_STANCE": 12,
+    }
+    for event in recovered:
+        for field, allowed in QUALIFIER_ENUMS.items():
+            assert event["qualifier"][field] in allowed

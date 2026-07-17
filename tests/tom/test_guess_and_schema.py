@@ -92,12 +92,12 @@ def _elicit(provider, *, player_view="view", required=(), forbidden=(3,), mask=N
 
 
 def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
-    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v3"
+    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v4"
     assert PROMPT_LANGUAGE == "zh-CN"
     expected_versions = {
         "gameplay": "gameplay.zh.v2",
         "belief": "belief.zh.v3",
-        "parser": "parser.zh.v2",
+        "parser": "parser.zh.v3",
     }
     for name, spec in CANONICAL_PROMPT_SPECS.items():
         assert spec["name"] == name
@@ -128,7 +128,7 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
     assert GAMEPLAY_PROMPT_SPEC["sha256"] == (
         "06f5b4865163af4ccad8c90e77525a8f95fe578ca45fcbd47f52946381506adc"
     )
-    assert PARSER_PROMPT_SPEC["sha256"] == (
+    assert PARSER_PROMPT_SPEC["sha256"] != (
         "8f796886879c3303feffa3ecf9915eeaf07ea6ce817433ba8a1734ea59ca84f7"
     )
     assert BELIEF_PROMPT_SPEC["sha256"] != (
@@ -136,6 +136,9 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
     )
     assert first != (
         "sha256:9e6ea40cedb78638d5fd9d3f66dbeb6bb8a3f6c6a15c44d59b68865d2453591e"
+    )
+    assert first != (
+        "sha256:532d1d603ccde38d3195589a28e230dfe8d2827252e36f39486888d185512b34"
     )
     assert '{"wolf_pair":[1,2]}' in json.loads(
         BELIEF_PROMPT_SPEC["text"]
@@ -783,6 +786,24 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
     old_v2_path.write_text(json.dumps(old_v2) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="unsupported prompt_protocol"):
         ToMDataset(old_v2_path)
+
+    old_parser_v2 = deepcopy(record)
+    old_parser_v2["prompt_protocol"].update(
+        protocol_version="prompt_protocol.zh.v3",
+        protocol_id=(
+            "sha256:532d1d603ccde38d3195589a28e230dfe8d2827252e36f39486888d185512b34"
+        ),
+    )
+    old_parser_v2["prompt_protocol"]["parser"] = {
+        "version": "parser.zh.v2",
+        "sha256": "8f796886879c3303feffa3ecf9915eeaf07ea6ce817433ba8a1734ea59ca84f7",
+    }
+    old_parser_v2_path = tmp_path / "old-parser-v2.jsonl"
+    old_parser_v2_path.write_text(
+        json.dumps(old_parser_v2) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="unsupported prompt_protocol"):
+        ToMDataset(old_parser_v2_path)
 
     mixed = deepcopy(record)
     mixed["sample_id"] = "fixture:first:mixed-protocol"

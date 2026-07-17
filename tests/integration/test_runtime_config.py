@@ -503,7 +503,7 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     ]
     assert parser_events
     assert all(
-        event["metadata"]["parser_protocol"]["version"] == "parser.zh.v2"
+        event["metadata"]["parser_protocol"]["version"] == "parser.zh.v3"
         and event["metadata"]["parser_protocol"]["sha256"]
         == PARSER_PROMPT_SPEC["sha256"]
         and event["metadata"]["parser_protocol"]["model"] == "deepseek-chat"
