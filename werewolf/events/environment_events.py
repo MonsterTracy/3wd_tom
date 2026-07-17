@@ -91,6 +91,12 @@ def wolf_team_event(**kwargs):
 
 
 def check_result_event(**kwargs):
+    if kwargs.get("target") is None or kwargs.get("value") not in {
+        "Werewolf", "Village"
+    }:
+        raise ValueError("CHECK_RESULT requires target and Werewolf/Village value")
+    if kwargs.get("visible_to") != [kwargs.get("speaker")]:
+        raise ValueError("CHECK_RESULT must be visible only to its seer speaker")
     return private_fact(kind="CHECK_RESULT", **kwargs)
 
 

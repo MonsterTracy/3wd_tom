@@ -123,6 +123,12 @@ def train_from_config(config):
     }
     train_dataset = ToMDataset(data["train_paths"], **dataset_kwargs)
     valid_dataset = ToMDataset(data["valid_paths"], **dataset_kwargs)
+    overlapping_games = sorted(train_dataset.game_ids & valid_dataset.game_ids)
+    if overlapping_games:
+        raise ValueError(
+            "train and validation data must be split by game_id; "
+            f"overlap={overlapping_games}"
+        )
     prompt_protocol_metadata = checkpoint_prompt_metadata(
         [train_dataset.prompt_protocol, valid_dataset.prompt_protocol]
     )

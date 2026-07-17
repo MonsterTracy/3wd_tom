@@ -13,9 +13,11 @@ from werewolf.prompt_protocol import (
 )
 from werewolf.tom.masks import (
     SECOND_ORDER_MODES,
+    first_order_constraints,
     first_order_knowledge_mask,
     second_order_output_mask,
 )
+from werewolf.tom.guess_provider import GUESS_ERROR_CODES
 from werewolf.tom.pair_space import NUM_WOLF_PAIRS, normalize_pair, pair_index
 
 
@@ -48,7 +50,17 @@ COMMON_FIELDS = {
     "guess",
     "prompt_protocol",
 }
-GUESS_FIELDS = {"status", "raw_text", "error", "attempts", "model"}
+GUESS_FIELDS = {
+    "status",
+    "raw_text",
+    "error",
+    "attempts",
+    "model",
+    "first_error_code",
+    "final_error_code",
+    "required_wolves",
+    "forbidden_wolves",
+}
 PROMPT_PROTOCOL_FIELDS = {
     "protocol_version",
     "language",
@@ -144,6 +156,13 @@ def _validate_mask(mask):
         raise ValueError("output_mask values must be booleans")
     if not any(mask):
         raise ValueError("output_mask must keep at least one class")
+
+
+def _validate_player_list(values, name):
+    if not isinstance(values, list) or values != sorted(set(values)):
+        raise ValueError(f"guess.{name} must be a sorted unique list")
+    if any(type(value) is not int or not 1 <= value <= 7 for value in values):
+        raise ValueError(f"guess.{name} must contain player ids between 1 and 7")
 
 
 def validate_sample(sample: dict, *, require_success=True) -> bool:
@@ -301,6 +320,25 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
         raise ValueError("guess.model must be text or null")
     if guess["error"] is not None and not isinstance(guess["error"], str):
         raise ValueError("guess.error must be text or null")
+    for name in ("required_wolves", "forbidden_wolves"):
+        _validate_player_list(guess[name], name)
+    if set(guess["required_wolves"]) & set(guess["forbidden_wolves"]):
+        raise ValueError("guess required and forbidden constraints overlap")
+    for name in ("first_error_code", "final_error_code"):
+        value = guess[name]
+        if value is not None and value not in GUESS_ERROR_CODES:
+            raise ValueError(f"guess.{name} is invalid")
+
+    if sample["task"] == "first_order":
+        expected_constraints = first_order_constraints(
+            observer_id=sample["observer_id"],
+            observer_role=knowledge["role"],
+            known_wolves=knowledge["known_wolves"],
+            known_good=knowledge["known_good"],
+        )
+        for name in ("required_wolves", "forbidden_wolves"):
+            if guess[name] != list(expected_constraints[name]):
+                raise ValueError(f"guess.{name} does not match visible hard knowledge")
 
     if guess["status"] == "ok":
         pair = normalize_pair(sample["label_pair"])
@@ -311,11 +349,25 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
             raise ValueError("label_pair is excluded by output_mask")
         if guess["error"] is not None:
             raise ValueError("successful guess cannot carry an error")
+        if guess["final_error_code"] is not None:
+            raise ValueError("successful guess cannot carry a final error code")
+        if guess["attempts"] == 1 and guess["first_error_code"] is not None:
+            raise ValueError("first-attempt success cannot carry an error code")
+        if guess["attempts"] == 2 and guess["first_error_code"] is None:
+            raise ValueError("repaired guess requires its first error code")
+        if not set(guess["required_wolves"]).issubset(pair):
+            raise ValueError("successful pair misses a required wolf")
+        if set(guess["forbidden_wolves"]) & set(pair):
+            raise ValueError("successful pair contains a forbidden player")
     else:
         if sample["label_pair"] is not None or sample["label_index"] is not None:
             raise ValueError("failed guesses cannot carry labels")
         if not guess["error"]:
             raise ValueError("failed guesses require an error")
+        if guess["attempts"] != 2:
+            raise ValueError("failed guesses require both attempts")
+        if guess["first_error_code"] is None or guess["final_error_code"] is None:
+            raise ValueError("failed guesses require first and final error codes")
         if require_success:
             raise ValueError("failed belief elicitation is not a training sample")
     return True
@@ -371,6 +423,10 @@ def make_sample(
             "error": guess.error,
             "attempts": guess.attempts,
             "model": guess.model,
+            "first_error_code": guess.first_error_code,
+            "final_error_code": guess.final_error_code,
+            "required_wolves": list(guess.required_wolves),
+            "forbidden_wolves": list(guess.forbidden_wolves),
         },
         "prompt_protocol": deepcopy(prompt_protocol),
     }

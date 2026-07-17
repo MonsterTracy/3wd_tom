@@ -38,8 +38,72 @@ class SpeechParseResult:
     events: tuple[dict, ...]
     raw_text: tuple[str, ...]
     error: str | None
+    error_code: str | None
     attempts: int
     model: str | None
+
+    def audit_metadata(self):
+        return {
+            "version": PARSER_PROMPT_SPEC["version"],
+            "sha256": PARSER_PROMPT_SPEC["sha256"],
+            "model": self.model,
+            "temperature": 0.0,
+            "status": self.status,
+            "attempts": self.attempts,
+            "error_code": self.error_code,
+            "error": self.error,
+        }
+
+
+class SpeechParserError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+_QUALIFIER_ALIASES = {
+    "certainty": {"low": "weak", "medium": "normal", "high": "strong"},
+    "strength": {"low": "weak", "medium": "normal", "high": "strong"},
+    "commitment": {
+        "low": "consider",
+        "undecided": "consider",
+        "medium": "intend",
+        "proposal": "intend",
+        "high": "commit",
+    },
+}
+
+
+def _normalize_parser_qualifier(qualifier):
+    if qualifier is None:
+        return {}
+    if not isinstance(qualifier, dict):
+        raise SpeechParserError("schema_validation", "qualifier must be an object or null")
+    normalized = dict(qualifier)
+    for field, aliases in _QUALIFIER_ALIASES.items():
+        value = normalized.get(field)
+        if isinstance(value, str):
+            normalized[field] = aliases.get(value.strip().lower(), value)
+    return normalized
+
+
+def _explicit_private_claim(utterance, source_span, *, speaker, target):
+    targets = target if isinstance(target, (list, tuple, set)) else [target]
+    if speaker in targets or not any(value in range(1, 8) for value in targets):
+        return False
+    start = utterance.find(source_span)
+    if start < 0:
+        return False
+    boundaries = "。！？!?;；\n"
+    left = max(utterance.rfind(mark, 0, start) for mark in boundaries) + 1
+    right_candidates = [
+        position
+        for mark in boundaries
+        if (position := utterance.find(mark, start + len(source_span))) >= 0
+    ]
+    right = min(right_candidates, default=len(utterance))
+    sentence = utterance[left:right]
+    return any(marker in sentence for marker in ("查验", "查杀", "验了", "验出"))
 
 
 def _parse_payload(
@@ -56,33 +120,62 @@ def _parse_payload(
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"response is not valid JSON: {exc.msg}") from exc
+        raise SpeechParserError(
+            "invalid_json", f"response is not valid JSON: {exc.msg}"
+        ) from exc
     if not isinstance(payload, dict) or set(payload) != {"events"}:
-        raise ValueError("response must contain only events")
+        raise SpeechParserError("schema_validation", "response must contain only events")
     if not isinstance(payload["events"], list):
-        raise ValueError("events must be a list")
+        raise SpeechParserError("schema_validation", "events must be a list")
 
     parsed = []
     for index, item in enumerate(payload["events"], start=1):
         if not isinstance(item, dict) or set(item) != PARSED_EVENT_FIELDS:
-            raise ValueError("parsed event fields do not match the speech schema")
+            raise SpeechParserError(
+                "schema_validation", "parsed event fields do not match the speech schema"
+            )
         if item["event_family"] not in SPEECH_FAMILIES:
-            raise ValueError("speech parser emitted a non-speech event family")
+            raise SpeechParserError(
+                "schema_validation", "speech parser emitted a non-speech event family"
+            )
         content = item["content"]
         if not isinstance(content, dict) or set(content) != {"kind", "value"}:
-            raise ValueError("parsed content must contain only kind and value")
+            raise SpeechParserError(
+                "schema_validation", "parsed content must contain only kind and value"
+            )
         if content["kind"] not in SPEECH_KINDS[item["event_family"]]:
-            raise ValueError("content.kind is not valid for its speech family")
-        normalized_content = normalize_content(content)
+            raise SpeechParserError(
+                "schema_validation", "content.kind is not valid for its speech family"
+            )
+        try:
+            normalized_content = normalize_content(content)
+        except ValueError as exc:
+            raise SpeechParserError("schema_validation", str(exc)) from exc
         if normalized_content != content:
-            raise ValueError("speech parser content.value must already be canonical")
+            raise SpeechParserError(
+                "schema_validation", "speech parser content.value must already be canonical"
+            )
         source_span = item["source_span"]
         if not isinstance(source_span, str) or not source_span:
-            raise ValueError("source_span must be a non-empty exact quote")
+            raise SpeechParserError(
+                "schema_validation", "source_span must be a non-empty exact quote"
+            )
         if source_span not in utterance:
-            raise ValueError("source_span is not present in the utterance")
-        parsed.append(
-            make_event(
+            raise SpeechParserError(
+                "schema_validation", "source_span is not present in the utterance"
+            )
+        qualifier = _normalize_parser_qualifier(item["qualifier"])
+        if (
+            item["event_family"] == "BELIEF_ASSERTION"
+            and content["kind"] in {"ROLE", "CAMP"}
+            and qualifier.get("evidence_source") is None
+            and _explicit_private_claim(
+                utterance, source_span, speaker=speaker, target=item["target"]
+            )
+        ):
+            qualifier["evidence_source"] = "claimed_private_info"
+        try:
+            event = make_event(
                 event_id=f"{utterance_id}.parsed.{index}",
                 utterance_id=utterance_id,
                 day=day,
@@ -96,12 +189,14 @@ def _parse_payload(
                 target=item["target"],
                 content=content,
                 metadata={"parser_protocol": parser_metadata},
-                qualifier=item["qualifier"],
+                qualifier=qualifier,
                 ref_event_id=item["ref_event_id"],
                 source_span=source_span,
                 parser_confidence=item["parser_confidence"],
             )
-        )
+        except ValueError as exc:
+            raise SpeechParserError("schema_validation", str(exc)) from exc
+        parsed.append(event)
     return tuple(parsed)
 
 
@@ -115,6 +210,7 @@ class SpeechEventParser:
     def parse(self, *, utterance, utterance_id, day, phase, turn, speaker):
         raw_text = []
         error = None
+        error_code = None
         user_content = json.dumps(
             {"speaker": speaker, "utterance": utterance}, ensure_ascii=False
         )
@@ -163,20 +259,26 @@ class SpeechEventParser:
                     },
                 )
                 return SpeechParseResult(
-                    status="ok",
+                    status="success" if events else "empty",
                     events=events,
                     raw_text=tuple(raw_text),
                     error=None,
+                    error_code=None,
                     attempts=attempt,
                     model=self.model,
                 )
+            except SpeechParserError as exc:
+                error_code = exc.code
+                error = f"{type(exc).__name__}: {exc}"
             except Exception as exc:
+                error_code = "backend_error"
                 error = f"{type(exc).__name__}: {exc}"
         return SpeechParseResult(
             status="failed",
             events=(),
             raw_text=tuple(raw_text),
             error=error or "speech parsing failed",
+            error_code=error_code or "backend_error",
             attempts=2,
             model=self.model,
         )

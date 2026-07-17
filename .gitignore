@@ -40,3 +40,5 @@ temp/
 *.tmp
 *.bak
 *.swp
+data/tom/*.jsonl
+data/tom/*.json

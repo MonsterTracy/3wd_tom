@@ -26,11 +26,13 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     second_state["public_state_id"] = "fixture:e5"
     train_path = tmp_path / "train.jsonl"
     valid_path = tmp_path / "valid.jsonl"
+    valid_record = deepcopy(first_order)
+    valid_record["game_id"] = "fixture-valid"
     train_path.write_text(
         "\n".join(json.dumps(record) for record in (first_order, second_state)) + "\n",
         encoding="utf-8",
     )
-    valid_path.write_text(json.dumps(first_order) + "\n", encoding="utf-8")
+    valid_path.write_text(json.dumps(valid_record) + "\n", encoding="utf-8")
     output_dir = tmp_path / "run"
     train_config = {
         "schema_version": "train.v1",
@@ -124,3 +126,33 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
                 "output": str(tmp_path / "mismatch-evaluation.json"),
             }
         )
+
+
+def test_training_rejects_a_game_split_across_train_and_validation(tmp_path):
+    record = json.loads(FIXTURE.read_text(encoding="utf-8").splitlines()[0])
+    train_path = tmp_path / "train.jsonl"
+    valid_path = tmp_path / "valid.jsonl"
+    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    valid_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    config = {
+        "schema_version": "train.v1",
+        "data": {
+            "train_paths": [str(train_path)],
+            "valid_paths": [str(valid_path)],
+            "task": "first_order",
+            "mode": "private_conditioned",
+            "include_first_order_private": True,
+        },
+        "model": {
+            "architecture": "boe_mlp", "d_model": 8, "num_layers": 1,
+            "num_heads": 2, "dropout": 0.0, "max_events": 16,
+            "max_day": 8, "use_target_embedding": True,
+        },
+        "training": {
+            "epochs": 1, "batch_size": 1, "learning_rate": 0.001,
+            "weight_decay": 0.0, "seed": 7, "device": "cpu",
+            "output_dir": str(tmp_path / "run"),
+        },
+    }
+    with pytest.raises(ValueError, match="split by game_id"):
+        train_from_config(config)

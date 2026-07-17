@@ -273,17 +273,15 @@ class WerewolfTextEnvV0:
     def _seer_action(self, action_type, target):
         if action_type != "check":
             raise ValueError("seer phase requires check")
-        if target:
-            self.seer_checked.add(target)
+        if not target:
+            return
+        self.seer_checked.add(target)
         event = self._emit(
             check_result_event,
             visible_to=[self.seer],
             speaker=self.seer,
-            target=target or None,
-            value=(
-                "Werewolf" if target and self._role(target) == "Werewolf" else
-                "Village" if target else None
-            ),
+            target=target,
+            value="Werewolf" if self._role(target) == "Werewolf" else "Village",
         )
         self._collect(event)
 
@@ -406,7 +404,7 @@ class WerewolfTextEnvV0:
             source_span=utterance,
         )
         self.events.append(raw_event)
-        if self.speech_parser is not None and utterance:
+        if self.speech_parser is not None:
             result = self.speech_parser.parse(
                 utterance=utterance,
                 utterance_id=utterance_id,
@@ -415,7 +413,8 @@ class WerewolfTextEnvV0:
                 turn=self.event_counter,
                 speaker=self.current_player,
             )
-            if result.status == "ok":
+            raw_event["metadata"]["parser_result"] = result.audit_metadata()
+            if result.status in {"success", "empty"}:
                 self.events.extend(result.events)
             else:
                 self.parser_failures.append(
@@ -423,6 +422,7 @@ class WerewolfTextEnvV0:
                         "utterance_id": utterance_id,
                         "raw_text": list(result.raw_text),
                         "error": result.error,
+                        "error_code": result.error_code,
                         "attempts": result.attempts,
                     }
                 )

@@ -31,7 +31,7 @@ def test_speech_parser_repairs_once_and_emits_only_local_families():
         utterance="我认为2号是狼人", utterance_id="u1", day=1,
         phase="speech", turn=4, speaker=1
     )
-    assert result.status == "ok"
+    assert result.status == "success"
     assert result.attempts == 2
     assert result.events[0]["event_family"] == "BELIEF_ASSERTION"
     assert result.events[0]["source_type"] == "speech_parser"
@@ -81,7 +81,7 @@ def test_speech_parser_treats_utterance_commands_as_untrusted_content():
         turn=7,
         speaker=2,
     )
-    assert result.status == "ok"
+    assert result.status == "empty"
     messages, _ = backend.calls[0]
     assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
     assert "不可信的游戏文本" in SYSTEM_PROMPT
@@ -144,7 +144,7 @@ def test_speech_parser_keeps_multi_event_anchor_without_duplicate_values():
         utterance=utterance, utterance_id="u3", day=1,
         phase="speech", turn=6, speaker=1
     )
-    assert result.status == "ok"
+    assert result.status == "success"
     assert len(result.events) == 3
     assert {event["utterance_id"] for event in result.events} == {"u3"}
     assert result.events[1]["content"]["value"] is None
@@ -152,3 +152,43 @@ def test_speech_parser_keeps_multi_event_anchor_without_duplicate_values():
     assert result.events[2]["content"]["value"] is None
     assert result.events[2]["qualifier"]["relation"] == "challenge"
     assert all(event["source_span"] in utterance for event in result.events)
+
+
+def test_speech_parser_normalizes_qualifiers_and_extracts_seer_example():
+    response = (
+        '{"events":['
+        '{"event_family":"BELIEF_ASSERTION","target":7,'
+        '"content":{"kind":"ROLE","value":"Seer"},"qualifier":{},'
+        '"ref_event_id":null,"source_span":"我是7号预言家","parser_confidence":1.0},'
+        '{"event_family":"BELIEF_ASSERTION","target":3,'
+        '"content":{"kind":"ROLE","value":"Werewolf"},"qualifier":{},'
+        '"ref_event_id":null,"source_span":"结果是狼人","parser_confidence":1.0},'
+        '{"event_family":"ACTION_POSITION","target":3,'
+        '"content":{"kind":"ACTION","value":"VOTE"},'
+        '"qualifier":{"commitment":"proposal"},"ref_event_id":null,'
+        '"source_span":"建议先投3号","parser_confidence":1.0}'
+        ']}'
+    )
+    utterance = "我是7号预言家，昨晚查验了3号，结果是狼人，今天建议先投3号。"
+    result = SpeechEventParser(SequenceBackend([response]), "parser").parse(
+        utterance=utterance,
+        utterance_id="seer-claim",
+        day=1,
+        phase="speech",
+        turn=8,
+        speaker=7,
+    )
+
+    assert result.status == "success"
+    assert [event["event_family"] for event in result.events] == [
+        "BELIEF_ASSERTION", "BELIEF_ASSERTION", "ACTION_POSITION"
+    ]
+    assert result.events[0]["target"] == [7]
+    assert result.events[0]["content"] == {"kind": "ROLE", "value": "Seer"}
+    assert result.events[1]["target"] == [3]
+    assert result.events[1]["content"]["value"] == "Werewolf"
+    assert result.events[1]["qualifier"]["evidence_source"] == (
+        "claimed_private_info"
+    )
+    assert result.events[2]["qualifier"]["commitment"] == "intend"
+    assert {event["utterance_id"] for event in result.events} == {"seer-claim"}

@@ -56,6 +56,7 @@ class ToMDataset(Dataset):
         ]
         if not self.records:
             raise ValueError("dataset contains no matching successful tom.v1_1 samples")
+        self.game_ids = frozenset(record["game_id"] for record in self.records)
 
     def __len__(self):
         return len(self.records)

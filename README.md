@@ -22,6 +22,8 @@ Second-order ToM predicts a living non-wolf target's guessed pair:
 
 Dead players remain in the 21-class identity space. The living-player set only
 controls whose belief is elicited and which game actions are legal.
+Tracking IDs are never model features; public dataset releases should remove
+date-bearing IDs or renumber them while preserving whole-game grouping.
 
 ## Unified events
 

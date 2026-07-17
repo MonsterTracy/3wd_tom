@@ -1,9 +1,17 @@
 import numpy as np
 import pytest
 
-from werewolf.events.environment_events import role_reveal_event, self_role_event
-from werewolf.events.streams import knowledge_for_player
-from werewolf.tom.masks import first_order_knowledge_mask, second_order_output_mask
+from werewolf.events.environment_events import (
+    check_result_event,
+    role_reveal_event,
+    self_role_event,
+)
+from werewolf.events.streams import knowledge_for_player, public_events
+from werewolf.tom.masks import (
+    first_order_constraints,
+    first_order_knowledge_mask,
+    second_order_output_mask,
+)
 from werewolf.tom.pair_space import (
     WOLF_PAIRS,
     masked_softmax,
@@ -101,3 +109,52 @@ def test_public_role_reveal_becomes_hard_first_order_knowledge():
         known_wolves=knowledge["known_wolves"], known_good=knowledge["known_good"]
     )
     assert all(1 in pair for pair, keep in zip(WOLF_PAIRS, mask) if keep)
+
+
+def test_seer_checks_become_required_and_forbidden_only_in_first_order():
+    events = [
+        self_role_event(
+            event_id="e1", day=0, phase="init", turn=1,
+            visible_to=[3], target=3, value="Seer"
+        ),
+        check_result_event(
+            event_id="e2", day=0, phase="night", turn=2,
+            visible_to=[3], speaker=3, target=1, value="Werewolf"
+        ),
+        check_result_event(
+            event_id="e3", day=1, phase="night", turn=3,
+            visible_to=[3], speaker=3, target=4, value="Village"
+        ),
+    ]
+    knowledge = knowledge_for_player(events, 3)
+    constraints = first_order_constraints(
+        observer_id=3,
+        observer_role=knowledge["role"],
+        known_wolves=knowledge["known_wolves"],
+        known_good=knowledge["known_good"],
+    )
+    mask = first_order_knowledge_mask(
+        observer_id=3,
+        observer_role=knowledge["role"],
+        known_wolves=knowledge["known_wolves"],
+        known_good=knowledge["known_good"],
+    )
+
+    assert constraints == {
+        "required_wolves": (1,),
+        "forbidden_wolves": (3, 4),
+    }
+    assert all(
+        1 in pair and 3 not in pair and 4 not in pair
+        for pair, keep in zip(WOLF_PAIRS, mask) if keep
+    )
+    assert public_events(events) == []
+    assert second_order_output_mask(mode="public_only", target_id=3).sum() == 21
+    assert all(
+        3 not in pair
+        for pair, keep in zip(
+            WOLF_PAIRS,
+            second_order_output_mask(mode="wolf_conditioned", target_id=3),
+        )
+        if keep
+    )

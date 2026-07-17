@@ -31,7 +31,6 @@ def sample_to_features(sample, *, include_first_order_private=True):
         "target_id": sample["target_id"] or 0,
         "output_mask": torch.tensor(sample["output_mask"], dtype=torch.bool),
         "label": sample["label_index"],
-        "sample_id": sample["sample_id"],
     }
 
 
@@ -58,7 +57,6 @@ def collate_features(features):
             "event_mask": event_mask,
             "output_mask": torch.stack([item["output_mask"] for item in features]),
             "labels": torch.tensor([item["label"] for item in features], dtype=torch.long),
-            "sample_ids": [item["sample_id"] for item in features],
         }
     )
     return batch

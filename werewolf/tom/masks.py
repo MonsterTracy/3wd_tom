@@ -24,6 +24,37 @@ def _player_set(values, name):
     return normalized
 
 
+def first_order_constraints(
+    *,
+    observer_id: int,
+    observer_role: str,
+    known_wolves=(),
+    known_good=(),
+) -> dict[str, tuple[int, ...]]:
+    """Return the hard pair constraints visible to one observer."""
+
+    observer_id = _player_id(observer_id, "observer_id")
+    if observer_role not in FIRST_ORDER_ROLES:
+        raise ValueError(f"unsupported observer_role: {observer_role!r}")
+    required_wolves = _player_set(known_wolves, "known_wolves")
+    forbidden_wolves = _player_set(known_good, "known_good")
+    if required_wolves & forbidden_wolves:
+        raise ValueError("a player cannot be both required and forbidden")
+
+    if observer_role == "Werewolf":
+        if observer_id not in required_wolves or len(required_wolves) != 2:
+            raise ValueError("a wolf observer must know the exact two-player wolf team")
+    else:
+        if observer_id in required_wolves:
+            raise ValueError("a non-wolf observer cannot be a required wolf")
+        forbidden_wolves.add(observer_id)
+
+    return {
+        "required_wolves": tuple(sorted(required_wolves)),
+        "forbidden_wolves": tuple(sorted(forbidden_wolves)),
+    }
+
+
 def first_order_knowledge_mask(
     *,
     observer_id: int,
@@ -38,24 +69,20 @@ def first_order_knowledge_mask(
     diagnostics; wolves are excluded from the main first-order collection path.
     """
 
-    observer_id = _player_id(observer_id, "observer_id")
-    if observer_role not in FIRST_ORDER_ROLES:
-        raise ValueError(f"unsupported observer_role: {observer_role!r}")
-    wolves = _player_set(known_wolves, "known_wolves")
-    good = _player_set(known_good, "known_good")
-    if wolves & good:
-        raise ValueError("a player cannot be both known wolf and known good")
-
-    if observer_role == "Werewolf":
-        if observer_id not in wolves or len(wolves) != 2:
-            raise ValueError("a wolf observer must know the exact two-player wolf team")
-    else:
-        if observer_id in wolves:
-            raise ValueError("a non-wolf observer cannot be a known wolf")
-        good.add(observer_id)
+    constraints = first_order_constraints(
+        observer_id=observer_id,
+        observer_role=observer_role,
+        known_wolves=known_wolves,
+        known_good=known_good,
+    )
+    required_wolves = set(constraints["required_wolves"])
+    forbidden_wolves = set(constraints["forbidden_wolves"])
 
     mask = np.asarray(
-        [wolves.issubset(pair) and good.isdisjoint(pair) for pair in WOLF_PAIRS],
+        [
+            required_wolves.issubset(pair) and forbidden_wolves.isdisjoint(pair)
+            for pair in WOLF_PAIRS
+        ],
         dtype=bool,
     )
     if not mask.any():

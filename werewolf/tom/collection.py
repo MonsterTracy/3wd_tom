@@ -19,7 +19,12 @@ from werewolf.events.streams import (
     render_stream,
     visible_events,
 )
-from werewolf.tom.masks import first_order_knowledge_mask, second_order_output_mask
+from werewolf.prompt_protocol import PARSER_PROMPT_SPEC
+from werewolf.tom.masks import (
+    first_order_constraints,
+    first_order_knowledge_mask,
+    second_order_output_mask,
+)
 from werewolf.tom.schemas import (
     FIRST_ORDER_MODE,
     first_order_key,
@@ -44,6 +49,8 @@ PRIVATE_FIRST_ORDER_CHECKPOINTS = {
     "WITCH_STATE": "after_witch_info",
     "GUARD_RESULT": "after_guard_result",
 }
+PARSER_FAILURE_RATE_LIMIT = 0.20
+BELIEF_SUCCESS_RATE_MINIMUM = 0.95
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,25 @@ def _safe_unknown_raw_value(value):
     if rendered.startswith(("'sk-", '"sk-')):
         return "'<redacted>'"
     return rendered[:160]
+
+
+def _raw_guess_pair(guess):
+    raw_text = guess.get("raw_text") if isinstance(guess, dict) else None
+    if not isinstance(raw_text, list) or not raw_text:
+        return None
+    try:
+        payload = json.loads(raw_text[-1])
+        values = payload["wolf_pair"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if (
+        not isinstance(values, list)
+        or len(values) != 2
+        or any(type(value) is not int or not 1 <= value <= 7 for value in values)
+        or values[0] == values[1]
+    ):
+        return None
+    return tuple(sorted(values))
 
 
 def build_audit_report(
@@ -247,6 +273,157 @@ def build_audit_report(
         max(0, record.get("guess", {}).get("attempts", 1) - 1)
         for record in unique_first.values()
     )
+    belief_failure_reasons = Counter()
+    belief_contains_observer_failures = 0
+    belief_missing_required_wolf_failures = 0
+    belief_contains_forbidden_player_failures = 0
+    belief_invalid_format_failures = 0
+    belief_success_constraint_violations = 0
+    belief_first_attempt_successes = 0
+    belief_repair_successes = 0
+    belief_repair_failures = 0
+    invalid_format_codes = {
+        "invalid_json",
+        "not_exactly_two_players",
+        "duplicate_players",
+        "out_of_range",
+    }
+    for record in unique_first.values():
+        guess = record.get("guess", {})
+        status = guess.get("status")
+        attempts = guess.get("attempts")
+        if status == "ok":
+            if attempts == 1:
+                belief_first_attempt_successes += 1
+            elif attempts == 2:
+                belief_repair_successes += 1
+            pair = record.get("label_pair") or []
+            if (
+                not set(guess.get("required_wolves", ())).issubset(pair)
+                or set(guess.get("forbidden_wolves", ())) & set(pair)
+            ):
+                belief_success_constraint_violations += 1
+            continue
+        if status != "failed":
+            continue
+        if attempts == 2:
+            belief_repair_failures += 1
+        error_code = guess.get("final_error_code") or "unknown"
+        belief_failure_reasons[error_code] += 1
+        pair = _raw_guess_pair(guess)
+        required = set(guess.get("required_wolves", ()))
+        forbidden = set(guess.get("forbidden_wolves", ()))
+        if pair is None:
+            belief_invalid_format_failures += 1
+        else:
+            if record.get("observer_id") in pair:
+                belief_contains_observer_failures += 1
+            if not required.issubset(pair):
+                belief_missing_required_wolf_failures += 1
+            if forbidden & set(pair):
+                belief_contains_forbidden_player_failures += 1
+        if error_code in invalid_format_codes and pair is not None:
+            belief_invalid_format_failures += 1
+    belief_success_rate = (
+        successful_guesses / len(unique_first) if unique_first else 1.0
+    )
+    belief_repair_success_rate = (
+        belief_repair_successes / repair_attempts if repair_attempts else 1.0
+    )
+
+    unique_events = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("events"), list):
+            continue
+        for event in record["events"]:
+            if isinstance(event, dict) and isinstance(event.get("event_id"), str):
+                unique_events.setdefault(
+                    (str(record.get("game_id")), event["event_id"]), event
+                )
+    speech_events = {
+        key: event
+        for key, event in unique_events.items()
+        if event.get("event_family") == "GAME_EVENT"
+        and event.get("content", {}).get("kind") == "SPEECH"
+    }
+    semantic_events = {
+        key: event
+        for key, event in unique_events.items()
+        if event.get("source_type") == "speech_parser"
+    }
+    speech_utterances = {
+        (game_id, event.get("utterance_id"))
+        for (game_id, _), event in speech_events.items()
+    }
+    semantic_utterances = {
+        (game_id, event.get("utterance_id"))
+        for (game_id, _), event in semantic_events.items()
+    }
+    parsed_event_families = Counter(
+        event.get("event_family") for event in semantic_events.values()
+    )
+    parser_statuses = Counter()
+    parser_failure_reasons = Counter()
+    parser_repair_attempts = 0
+    missing_parser_metadata_count = 0
+    parser_metadata_fields = {
+        "version",
+        "sha256",
+        "model",
+        "temperature",
+        "status",
+        "attempts",
+        "error_code",
+        "error",
+    }
+    valid_parser_metadata = {}
+    for key, event in speech_events.items():
+        metadata = event.get("metadata", {}).get("parser_result")
+        valid = (
+            isinstance(metadata, dict)
+            and set(metadata) == parser_metadata_fields
+            and metadata.get("version") == PARSER_PROMPT_SPEC["version"]
+            and metadata.get("sha256") == PARSER_PROMPT_SPEC["sha256"]
+            and isinstance(metadata.get("model"), str)
+            and bool(metadata.get("model"))
+            and metadata.get("temperature") == 0.0
+            and metadata.get("status") in {"success", "empty", "failed"}
+            and type(metadata.get("attempts")) is int
+            and 1 <= metadata["attempts"] <= 2
+            and (
+                (
+                    metadata.get("status") in {"success", "empty"}
+                    and metadata.get("error_code") is None
+                    and metadata.get("error") is None
+                )
+                or (
+                    metadata.get("status") == "failed"
+                    and isinstance(metadata.get("error_code"), str)
+                    and bool(metadata.get("error_code"))
+                    and isinstance(metadata.get("error"), str)
+                    and bool(metadata.get("error"))
+                )
+            )
+        )
+        if not valid:
+            missing_parser_metadata_count += 1
+            continue
+        valid_parser_metadata[key] = metadata
+        parser_statuses[metadata["status"]] += 1
+        parser_repair_attempts += metadata["attempts"] - 1
+        if metadata["status"] == "failed":
+            parser_failure_reasons[metadata.get("error_code") or "unknown"] += 1
+    parser_utterance_mismatch_count = len(speech_events) - len(speech_utterances)
+    parser_utterance_mismatch_count += sum(
+        utterance not in speech_utterances for utterance in semantic_utterances
+    )
+    for key, metadata in valid_parser_metadata.items():
+        game_id = key[0]
+        utterance_id = speech_events[key]["utterance_id"]
+        has_semantic = (game_id, utterance_id) in semantic_utterances
+        if (metadata["status"] == "success") != has_semantic:
+            parser_utterance_mismatch_count += 1
+    speech_with_semantic_events = len(speech_utterances & semantic_utterances)
 
     mask_sizes = Counter()
     pair_labels = Counter()
@@ -336,7 +513,7 @@ def build_audit_report(
         "max": max(sequence_lengths, default=0),
     }
     return {
-        "schema_version": "tom.audit.v1_2",
+        "schema_version": "tom.audit.v1_3",
         "games": len(games),
         "public_checkpoints": len(public_checkpoints),
         "private_checkpoints": len(private_checkpoints),
@@ -344,6 +521,30 @@ def build_audit_report(
         "successful_guesses": successful_guesses,
         "failed_guesses": failed_guesses,
         "repair_attempts": repair_attempts,
+        "belief_failure_reason_distribution": _distribution(belief_failure_reasons),
+        "belief_first_attempt_successes": belief_first_attempt_successes,
+        "belief_repair_successes": belief_repair_successes,
+        "belief_repair_failures": belief_repair_failures,
+        "belief_contains_observer_failures": belief_contains_observer_failures,
+        "belief_missing_required_wolf_failures": belief_missing_required_wolf_failures,
+        "belief_contains_forbidden_player_failures": belief_contains_forbidden_player_failures,
+        "belief_invalid_format_failures": belief_invalid_format_failures,
+        "belief_success_constraint_violations": belief_success_constraint_violations,
+        "belief_success_rate": belief_success_rate,
+        "belief_repair_success_rate": belief_repair_success_rate,
+        "speech_event_count": len(speech_events),
+        "parser_call_count": len(valid_parser_metadata),
+        "parser_success_count": parser_statuses["success"],
+        "parser_empty_count": parser_statuses["empty"],
+        "parser_failure_count": parser_statuses["failed"],
+        "parser_repair_attempts": parser_repair_attempts,
+        "parsed_semantic_event_count": len(semantic_events),
+        "speech_with_semantic_events": speech_with_semantic_events,
+        "speech_without_semantic_events": len(speech_events) - speech_with_semantic_events,
+        "parsed_event_family_distribution": _distribution(parsed_event_families),
+        "parser_failure_reason_distribution": _distribution(parser_failure_reasons),
+        "missing_parser_metadata_count": missing_parser_metadata_count,
+        "parser_utterance_mismatch_count": parser_utterance_mismatch_count,
         "first_order_samples": sum(
             sample.get("task") == "first_order" for sample in successful
         ),
@@ -416,6 +617,10 @@ def assert_audit_passes(report):
         "unknown_value_count",
         "missing_prompt_protocol_count",
         "invalid_prompt_protocol_count",
+        "belief_contains_observer_failures",
+        "belief_success_constraint_violations",
+        "missing_parser_metadata_count",
+        "parser_utterance_mismatch_count",
     )
     failures = {name: report.get(name, 0) for name in fatal_fields if report.get(name, 0)}
     for field in (
@@ -427,6 +632,34 @@ def assert_audit_passes(report):
         values = report.get(field, [])
         if len(values) != 1:
             failures[field] = values
+    speech_count = report.get("speech_event_count", 0)
+    parser_calls = report.get("parser_call_count", 0)
+    parser_outcomes = sum(
+        report.get(field, 0)
+        for field in ("parser_success_count", "parser_empty_count", "parser_failure_count")
+    )
+    if speech_count != parser_calls:
+        failures["speech_event_count/parser_call_count"] = [
+            speech_count,
+            parser_calls,
+        ]
+    if parser_calls != parser_outcomes:
+        failures["parser_call_outcome_invariant"] = [parser_calls, parser_outcomes]
+    if speech_count > 0 and report.get("parsed_semantic_event_count", 0) == 0:
+        failures["parsed_semantic_event_count"] = 0
+    parser_failure_count = report.get("parser_failure_count", 0)
+    if parser_calls and parser_failure_count / parser_calls > PARSER_FAILURE_RATE_LIMIT:
+        failures["parser_failure_rate"] = parser_failure_count / parser_calls
+    if (
+        report.get("unique_belief_elicitations", 0)
+        and report.get("belief_success_rate", 0.0) < BELIEF_SUCCESS_RATE_MINIMUM
+    ):
+        failures["belief_success_rate"] = report.get("belief_success_rate")
+    if (
+        report.get("repair_attempts", 0) > 0
+        and report.get("belief_repair_success_rate", 0.0) == 0.0
+    ):
+        failures["belief_repair_success_rate"] = 0.0
     if failures:
         raise RuntimeError(f"collection audit failed: {failures}")
     return True
@@ -499,10 +732,19 @@ class ToMCollector:
             known_wolves=knowledge["known_wolves"],
             known_good=knowledge["known_good"],
         )
+        constraints = first_order_constraints(
+            observer_id=target_id,
+            observer_role=role,
+            known_wolves=knowledge["known_wolves"],
+            known_good=knowledge["known_good"],
+        )
         view = render_stream(visible_events(events, target_id))
         return self.guess_provider_for(target_id).elicit(
+            observer_id=target_id,
             player_view=view,
             output_mask=mask,
+            required_wolves=constraints["required_wolves"],
+            forbidden_wolves=constraints["forbidden_wolves"],
         ), mask
 
     def _base(self, trigger_event, checkpoint):

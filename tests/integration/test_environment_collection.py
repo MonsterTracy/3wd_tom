@@ -16,7 +16,7 @@ from werewolf.events.environment_events import (
     wolf_team_event,
 )
 from werewolf.events.speech_parser import SpeechEventParser
-from werewolf.events.streams import visible_events
+from werewolf.events.streams import public_events, visible_events
 from werewolf.prompt_protocol import build_prompt_protocol, protocol_id_from_references
 from werewolf.tom.collection import (
     JsonlSink,
@@ -53,11 +53,17 @@ class EmptyParserBackend:
 
 
 class ValidGuessProvider:
-    def elicit(self, *, player_view, output_mask):
+    def elicit(
+        self, *, player_view, output_mask, observer_id,
+        required_wolves, forbidden_wolves
+    ):
         pair = next(pair for pair, allowed in zip(WOLF_PAIRS, output_mask) if allowed)
         return GuessResult(
             status="ok", pair=pair, raw_text=(f'{{"wolf_pair":{list(pair)}}}',),
-            error=None, attempts=1, model="fake"
+            error=None, attempts=1, model="fake",
+            first_error_code=None, final_error_code=None,
+            required_wolves=tuple(required_wolves),
+            forbidden_wolves=tuple(forbidden_wolves),
         )
 
 
@@ -144,7 +150,10 @@ def test_guess_failure_does_not_stop_the_game_or_enter_samples(tmp_path):
         def elicit(self, **kwargs):
             return GuessResult(
                 status="failed", pair=None, raw_text=("bad", "bad"),
-                error="invalid", attempts=2, model="fake"
+                error="invalid", attempts=2, model="fake",
+                first_error_code="invalid_json", final_error_code="invalid_json",
+                required_wolves=tuple(kwargs["required_wolves"]),
+                forbidden_wolves=tuple(kwargs["forbidden_wolves"]),
             )
 
     collector = ToMCollector(
@@ -273,6 +282,19 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         "schema_version", "games", "public_checkpoints", "private_checkpoints",
         "unique_belief_elicitations", "successful_guesses", "failed_guesses",
         "repair_attempts", "first_order_samples", "second_order_public_samples",
+        "belief_failure_reason_distribution", "belief_first_attempt_successes",
+        "belief_repair_successes", "belief_repair_failures",
+        "belief_contains_observer_failures",
+        "belief_missing_required_wolf_failures",
+        "belief_contains_forbidden_player_failures",
+        "belief_invalid_format_failures", "belief_success_rate",
+        "belief_repair_success_rate", "belief_success_constraint_violations",
+        "speech_event_count", "parser_call_count", "parser_success_count",
+        "parser_empty_count", "parser_failure_count", "parser_repair_attempts",
+        "parsed_semantic_event_count", "speech_with_semantic_events",
+        "speech_without_semantic_events", "parsed_event_family_distribution",
+        "parser_failure_reason_distribution", "missing_parser_metadata_count",
+        "parser_utterance_mismatch_count",
         "second_order_wolf_samples", "duplicate_sample_ids",
         "duplicate_first_order_keys", "duplicate_second_order_keys",
         "state_alignment_errors", "private_to_second_order_errors",
@@ -295,6 +317,9 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["public_checkpoints"] == 1
     assert report["unique_belief_elicitations"] == 1
     assert report["successful_guesses"] == 1
+    assert report["belief_first_attempt_successes"] == 1
+    assert report["belief_success_rate"] == 1.0
+    assert report["belief_repair_success_rate"] == 1.0
     assert report["first_order_samples"] == 1
     assert report["second_order_public_samples"] == 1
     assert report["unknown_kind_count"] == 0
@@ -314,6 +339,8 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["parser_prompt_versions"] == ["parser.zh.v1"]
     assert report["missing_prompt_protocol_count"] == 0
     assert report["invalid_prompt_protocol_count"] == 0
+    assert report["speech_event_count"] == 0
+    assert report["parser_call_count"] == 0
     assert assert_audit_passes(report)
 
     duplicate_report = build_audit_report(records + [deepcopy(records[0])])
@@ -388,13 +415,53 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         assert_audit_passes(mixed_protocol_report)
 
 
-def test_failed_guess_is_audited_but_is_not_a_fatal_gate():
+def test_parser_audit_fails_missing_calls_zero_semantics_and_high_failure_rate():
+    records = [json.loads(line) for line in FIXTURE.read_text(encoding="utf-8").splitlines()]
+    speech = speech_event(
+        event_id="fixture.speech",
+        utterance_id="fixture.speech",
+        day=1,
+        phase="1_day_speech",
+        turn=3,
+        speaker=3,
+        target=3,
+        value=None,
+        source_span="statement",
+    )
+    records[0]["events"].append(deepcopy(speech))
+    records[1]["events"].append(deepcopy(speech))
+    report = build_audit_report(records)
+    assert report["speech_event_count"] == 1
+    assert report["parser_call_count"] == 0
+    assert report["parsed_semantic_event_count"] == 0
+    assert report["missing_parser_metadata_count"] == 1
+    with pytest.raises(RuntimeError, match="parser_call_count|parser_metadata"):
+        assert_audit_passes(report)
+
+    rate_report = build_audit_report(
+        [json.loads(line) for line in FIXTURE.read_text(encoding="utf-8").splitlines()]
+    )
+    rate_report.update(
+        speech_event_count=5,
+        parser_call_count=5,
+        parser_success_count=3,
+        parser_empty_count=0,
+        parser_failure_count=2,
+        parsed_semantic_event_count=3,
+    )
+    with pytest.raises(RuntimeError, match="parser_failure_rate"):
+        assert_audit_passes(rate_report)
+
+
+def test_failed_guess_is_audited_and_fails_the_quality_gate():
     failures = [json.loads(line) for line in FIXTURE.read_text(encoding="utf-8").splitlines()]
     for record in failures:
         record["label_pair"] = None
         record["label_index"] = None
         record["guess"].update(
-            status="failed", raw_text=["bad", "still bad"], error="invalid", attempts=2
+            status="failed", raw_text=["bad", "still bad"], error="invalid",
+            attempts=2, first_error_code="invalid_json",
+            final_error_code="invalid_json"
         )
     report = build_audit_report([], failures)
     assert report["unique_belief_elicitations"] == 1
@@ -402,7 +469,11 @@ def test_failed_guess_is_audited_but_is_not_a_fatal_gate():
     assert report["failed_guesses"] == 1
     assert report["repair_attempts"] == 1
     assert report["first_order_samples"] == 0
-    assert assert_audit_passes(report)
+    assert report["belief_invalid_format_failures"] == 1
+    assert report["belief_success_rate"] == 0.0
+    assert report["belief_repair_success_rate"] == 0.0
+    with pytest.raises(RuntimeError, match="belief_success_rate"):
+        assert_audit_passes(report)
 
 
 def test_fixed_seven_player_roles_and_both_win_conditions():
@@ -459,7 +530,15 @@ def test_night_order_seer_witch_death_and_private_visibility():
 
     seer_view = visible_events(environment.events, 3)
     check = next(event for event in seer_view if event["content"]["kind"] == "CHECK_RESULT")
+    assert check["target"] == [1]
     assert check["content"]["value"] == "Werewolf"
+    assert check["speaker"] == 3
+    assert check["visibility"] == "private"
+    assert check["visible_to"] == [3]
+    assert not any(
+        event["content"]["kind"] == "CHECK_RESULT"
+        for event in public_events(environment.events)
+    )
     wolf_view = visible_events(environment.events, 1)
     nonwolf_view = visible_events(environment.events, 5)
     assert any(event["content"]["kind"] == "WOLF_TEAM" for event in wolf_view)
@@ -472,6 +551,27 @@ def test_night_order_seer_witch_death_and_private_visibility():
         for event in nonwolf_view
     )
     assert not any(event["content"]["kind"] == "CHECK_RESULT" for event in nonwolf_view)
+
+
+def test_seer_village_check_has_canonical_target_value_and_private_visibility():
+    environment = WerewolfTextEnvV0(random_seed=2)
+    environment.reset(roles=ROLES)
+    environment.step(("kill", 5))
+    environment.step(("kill", 5))
+    environment.step(("check", 5))
+
+    check = next(
+        event for event in environment.events
+        if event["content"]["kind"] == "CHECK_RESULT"
+    )
+    assert check["target"] == [5]
+    assert check["content"] == {"kind": "CHECK_RESULT", "value": "Village"}
+    assert check["speaker"] == 3
+    assert check["visible_to"] == [3]
+    assert all(
+        not any(event["content"]["kind"] == "CHECK_RESULT" for event in visible_events(environment.events, player_id))
+        for player_id in (1, 2, 4, 5, 6, 7)
+    )
 
 
 def test_guard_variant_protects_at_night_and_records_private_result():

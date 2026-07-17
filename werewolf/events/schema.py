@@ -65,7 +65,7 @@ CONTENT_VALUES_BY_KIND = {
     "OUTCOME": CAMP_VALUES,
     "SELF_ROLE": ROLE_VALUES,
     "WOLF_TEAM": (None,),
-    "CHECK_RESULT": (None, *CAMP_VALUES),
+    "CHECK_RESULT": CAMP_VALUES,
     "WITCH_STATE": WITCH_STATE_VALUES,
     "GUARD_RESULT": (None,),
     "PRIVATE_ACTION_RESULT": PRIVATE_ACTION_VALUES,
@@ -190,9 +190,7 @@ def normalize_content(content) -> dict:
         if not isinstance(value, str):
             raise ValueError(f"{kind} requires a controlled role value")
         value = _ROLE_ALIASES.get(value.strip().lower())
-    elif kind in {"CAMP", "OUTCOME"} or (
-        kind == "CHECK_RESULT" and value is not None
-    ):
+    elif kind in {"CAMP", "OUTCOME", "CHECK_RESULT"}:
         if not isinstance(value, str):
             raise ValueError(f"{kind} requires a controlled camp value")
         value = _CAMP_ALIASES.get(value.strip().lower())
@@ -310,9 +308,8 @@ def validate_event(event: dict) -> bool:
     if content["kind"] == "WOLF_TEAM" and len(event["target"]) != 2:
         raise ValueError("WOLF_TEAM requires the two wolf ids in target")
     if content["kind"] == "CHECK_RESULT":
-        expected_none = not event["target"]
-        if (content["value"] is None) != expected_none:
-            raise ValueError("CHECK_RESULT requires a camp exactly when target is set")
+        if len(event["target"]) != 1 or content["value"] not in CAMP_VALUES:
+            raise ValueError("CHECK_RESULT requires one target and a canonical camp")
     if not isinstance(event["metadata"], dict):
         raise ValueError("metadata must be a mapping")
     if not isinstance(event["qualifier"], dict) or set(event["qualifier"]) != set(

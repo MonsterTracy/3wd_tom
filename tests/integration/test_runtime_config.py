@@ -86,9 +86,15 @@ def test_collection_preflight_resolves_guess_inheritance_and_override_without_ne
 
 
 class DeterministicFakeBackend:
+    def __init__(self):
+        self.parser_calls = 0
+
     def chat(self, messages, **kwargs):
         system = messages[0]["content"] if messages[0]["role"] == "system" else ""
         if system == PARSER_PROMPT_SPEC["text"]:
+            self.parser_calls += 1
+            if self.parser_calls == 1:
+                return '{"events":[]}'
             return (
                 '{"events":[{"event_family":"BELIEF_ASSERTION","target":[],'
                 '"content":{"kind":"FACT","value":null},"qualifier":{},'
@@ -101,6 +107,9 @@ class DeterministicFakeBackend:
                 line for line in view.splitlines() if "kind=SELF_ROLE" in line
             )
             observer_id = int(re.search(r"target=(\d+)", self_role).group(1))
+            if len(messages) == 2:
+                other = 1 if observer_id != 1 else 2
+                return json.dumps({"wolf_pair": [observer_id, other]})
             known_wolves = set()
             known_good = {observer_id}
             for line in view.splitlines():
@@ -147,6 +156,14 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert audit["unique_belief_elicitations"] > 0
     assert audit["successful_guesses"] == audit["unique_belief_elicitations"]
     assert audit["failed_guesses"] == 0
+    assert audit["belief_first_attempt_successes"] == 0
+    assert audit["belief_repair_successes"] == audit["unique_belief_elicitations"]
+    assert audit["belief_repair_failures"] == 0
+    assert audit["belief_contains_observer_failures"] == 0
+    assert audit["belief_missing_required_wolf_failures"] == 0
+    assert audit["belief_contains_forbidden_player_failures"] == 0
+    assert audit["belief_success_rate"] == 1.0
+    assert audit["belief_repair_success_rate"] == 1.0
     assert audit["first_order_samples"] > 0
     assert audit["second_order_public_samples"] > 0
     assert audit["second_order_wolf_samples"] > 0
@@ -158,6 +175,16 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert audit["unknown_token_ratio"] == 0.0
     assert audit["not_applicable_value_count"] > 0
     assert audit["top_unknown_raw_values"] == []
+    assert audit["speech_event_count"] > 0
+    assert audit["parser_call_count"] == audit["speech_event_count"]
+    assert audit["parser_success_count"] > 0
+    assert audit["parser_empty_count"] == 1
+    assert audit["parser_failure_count"] == 0
+    assert audit["parsed_semantic_event_count"] > 0
+    assert audit["speech_with_semantic_events"] > 0
+    assert audit["speech_without_semantic_events"] == 1
+    assert audit["missing_parser_metadata_count"] == 0
+    assert audit["parser_utterance_mismatch_count"] == 0
     samples = [
         json.loads(line)
         for line in Path(config["output"]["samples"]).read_text(
@@ -195,6 +222,21 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
         and event["metadata"]["parser_protocol"]["temperature"] == 0.0
         and event["metadata"]["parser_protocol"]["status"] == "ok"
         for event in parser_events
+    )
+    unique_events = {
+        event["event_id"]: event for sample in samples for event in sample["events"]
+    }
+    check_results = [
+        event for event in unique_events.values()
+        if event["content"]["kind"] == "CHECK_RESULT"
+    ]
+    assert check_results
+    assert all(
+        len(event["target"]) == 1
+        and event["content"]["value"] in {"Werewolf", "Village"}
+        and event["visibility"] == "private"
+        and event["visible_to"] == [event["speaker"]]
+        for event in check_results
     )
     log_records = [
         json.loads(line)

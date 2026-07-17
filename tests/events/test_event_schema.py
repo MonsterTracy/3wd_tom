@@ -128,7 +128,7 @@ def _parsed_event(*, event_family, kind, value, qualifier=None):
 def test_schema_normalizes_aliases_and_rejects_uncontrolled_values():
     camp = check_result_event(
         event_id="alias.camp", day=1, phase="night", turn=1,
-        visible_to=[3], speaker=3, target=2, value="good"
+        visible_to=[3], speaker=3, target=2, value="Village"
     )
     role = self_role_event(
         event_id="alias.role", day=0, phase="init", turn=2,
@@ -138,6 +138,21 @@ def test_schema_normalizes_aliases_and_rejects_uncontrolled_values():
     assert role["content"]["value"] == "Seer"
     value_index = EVENT_TOKEN_FIELDS.index("value_id")
     assert encode_event(camp)[0][value_index] == VALUE2ID["Village"]
+    with pytest.raises(ValueError, match="Werewolf/Village"):
+        check_result_event(
+            event_id="alias.bad-camp", day=1, phase="night", turn=1,
+            visible_to=[3], speaker=3, target=2, value="good"
+        )
+    with pytest.raises(ValueError, match="requires target"):
+        check_result_event(
+            event_id="alias.no-target", day=1, phase="night", turn=1,
+            visible_to=[3], speaker=3, target=None, value="Village"
+        )
+    with pytest.raises(ValueError, match="only to its seer speaker"):
+        check_result_event(
+            event_id="alias.leak", day=1, phase="night", turn=1,
+            visible_to=[3, 4], speaker=3, target=2, value="Village"
+        )
     with pytest.raises(ValueError, match="ROLE|controlled"):
         _parsed_event(
             event_family="BELIEF_ASSERTION", kind="ROLE", value="Wizard"
