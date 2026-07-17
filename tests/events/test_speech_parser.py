@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from werewolf.backends.base import BackendError
 from werewolf.events.encoder import encode_event
 from werewolf.events.schema import QUALIFIER_ENUMS, validate_event
 from werewolf.events.speech_parser import (
@@ -14,11 +15,14 @@ from werewolf.events.speech_parser import (
     _parse_payload,
 )
 from werewolf.prompt_protocol import (
+    CANONICAL_PROMPT_SPECS,
     PARSER_FEW_SHOTS,
     PARSER_PROMPT_SPEC,
     PARSER_SYSTEM_PROMPT,
     parser_few_shot_messages,
+    protocol_id_from_specs,
 )
+import werewolf.events.speech_parser as speech_parser_module
 
 
 class SequenceBackend:
@@ -28,7 +32,10 @@ class SequenceBackend:
 
     def chat(self, messages, **kwargs):
         self.calls.append((deepcopy(messages), kwargs))
-        return next(self.responses)
+        response = next(self.responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def test_speech_parser_repairs_once_and_emits_only_local_families():
@@ -68,6 +75,61 @@ def test_speech_parser_repairs_once_and_emits_only_local_families():
     second_messages, _ = backend.calls[1]
     assert "上一条 json 不符合 schema" not in first_messages[-1]["content"]
     assert "上一条 json 不符合 schema" in second_messages[-1]["content"]
+
+
+def test_speech_parser_backend_error_fails_once_without_semantic_repair(
+    monkeypatch,
+):
+    backend = SequenceBackend(
+        [
+            BackendError(
+                "OpenAI-compatible chat request failed.",
+                retryable=True,
+                details={
+                    "cause_type": "APIConnectionError",
+                    "safe_message": "connection failed",
+                },
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        speech_parser_module,
+        "parser_repair_message",
+        lambda *args, **kwargs: pytest.fail(
+            "backend errors must not build a semantic repair message"
+        ),
+    )
+
+    result = SpeechEventParser(backend, "parser").parse(
+        utterance="2号像狼", utterance_id="backend-error", day=1,
+        phase="1_day_speech", turn=2, speaker=1,
+    )
+
+    assert result.status == "failed"
+    assert result.attempts == 1
+    assert result.events == ()
+    assert result.raw_text == ()
+    assert result.error_code == "backend_error"
+    assert result.error.startswith("BackendError: OpenAI-compatible chat request failed.")
+    assert "APIConnectionError" in result.error
+    assert len(backend.calls) == 1
+    messages, _ = backend.calls[0]
+    assert len(messages) == 2 + len(parser_few_shot_messages())
+    assert messages[-1]["role"] == "user"
+    assert messages[-2]["role"] == "assistant"
+    assert messages[1:-1] == parser_few_shot_messages()
+
+
+def test_parser_backend_error_boundary_does_not_change_prompt_protocol():
+    assert PARSER_PROMPT_SPEC == {
+        "name": "parser",
+        "version": "parser.zh.v3",
+        "sha256": "0e8d205bc640273c450a10d6760076e6db3fab4547796476d5fa59a0f31732a4",
+        "text": PARSER_PROMPT_SPEC["text"],
+    }
+    assert protocol_id_from_specs(CANONICAL_PROMPT_SPECS) == (
+        "sha256:ad69ce60dc4311d33106765c41b761bfc4298096dc72180215eb3bf26b70f744"
+    )
 
 
 def test_speech_parser_drops_forbidden_or_unanchored_output():
@@ -211,7 +273,7 @@ def test_speech_parser_keeps_multi_event_anchor_without_duplicate_values():
     assert all(event["source_span"] in utterance for event in result.events)
 
 
-def test_speech_parser_normalizes_qualifiers_and_extracts_seer_example():
+def test_speech_parser_normalizes_qualifiers_without_inferring_evidence_source():
     response = (
         '{"events":['
         '{"event_family":"BELIEF_ASSERTION","target":7,'
@@ -244,11 +306,40 @@ def test_speech_parser_normalizes_qualifiers_and_extracts_seer_example():
     assert result.events[0]["content"] == {"kind": "ROLE", "value": "Seer"}
     assert result.events[1]["target"] == [3]
     assert result.events[1]["content"]["value"] == "Werewolf"
-    assert result.events[1]["qualifier"]["evidence_source"] == (
-        "claimed_private_info"
-    )
+    assert result.events[1]["qualifier"]["evidence_source"] is None
     assert result.events[2]["qualifier"]["commitment"] == "intend"
     assert {event["utterance_id"] for event in result.events} == {"seer-claim"}
+
+
+@pytest.mark.parametrize(
+    "evidence_source",
+    ["public_history", "claimed_private_info", "unspecified"],
+)
+def test_speech_parser_accepts_canonical_evidence_source(evidence_source):
+    response = json.dumps(
+        {
+            "events": [
+                {
+                    "event_family": "BELIEF_ASSERTION",
+                    "target": [2],
+                    "content": {"kind": "CAMP", "value": "Werewolf"},
+                    "qualifier": {"evidence_source": evidence_source},
+                    "ref_event_id": None,
+                    "source_span": "2号像狼",
+                    "parser_confidence": 0.8,
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    result = SpeechEventParser(SequenceBackend([response]), "parser").parse(
+        utterance="2号像狼", utterance_id=f"canonical-{evidence_source}", day=1,
+        phase="1_day_speech", turn=2, speaker=1,
+    )
+
+    assert result.status == "success"
+    assert result.events[0]["qualifier"]["evidence_source"] == evidence_source
 
 
 @pytest.mark.parametrize(

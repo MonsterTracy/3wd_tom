@@ -3,6 +3,7 @@
 import json
 from dataclasses import dataclass
 
+from werewolf.backends.base import BackendError
 from werewolf.events.schema import QUALIFIER_ENUMS, make_event, normalize_content
 from werewolf.prompt_protocol import (
     PARSER_PROMPT_SPEC,
@@ -193,25 +194,6 @@ def _normalize_parser_qualifier(qualifier, *, event_index=None):
     return normalized
 
 
-def _explicit_private_claim(utterance, source_span, *, speaker, target):
-    targets = target if isinstance(target, (list, tuple, set)) else [target]
-    if speaker in targets or not any(value in range(1, 8) for value in targets):
-        return False
-    start = utterance.find(source_span)
-    if start < 0:
-        return False
-    boundaries = "。！？!?;；\n"
-    left = max(utterance.rfind(mark, 0, start) for mark in boundaries) + 1
-    right_candidates = [
-        position
-        for mark in boundaries
-        if (position := utterance.find(mark, start + len(source_span))) >= 0
-    ]
-    right = min(right_candidates, default=len(utterance))
-    sentence = utterance[left:right]
-    return any(marker in sentence for marker in ("查验", "查杀", "验了", "验出"))
-
-
 def _parse_payload(
     text,
     *,
@@ -273,15 +255,6 @@ def _parse_payload(
         qualifier = _normalize_parser_qualifier(
             item["qualifier"], event_index=index
         )
-        if (
-            item["event_family"] == "BELIEF_ASSERTION"
-            and content["kind"] in {"ROLE", "CAMP"}
-            and qualifier.get("evidence_source") is None
-            and _explicit_private_claim(
-                utterance, source_span, speaker=speaker, target=item["target"]
-            )
-        ):
-            qualifier["evidence_source"] = "claimed_private_info"
         try:
             event = make_event(
                 event_id=f"{utterance_id}.parsed.{index}",
@@ -383,16 +356,27 @@ class SpeechEventParser:
                 parser_error = exc
                 error_code = exc.code
                 error = f"{type(exc).__name__}: {exc}"
-            except Exception as exc:
+            except BackendError as exc:
                 parser_error = None
                 error_code = "backend_error"
                 error = f"{type(exc).__name__}: {exc}"
+                break
+            except Exception as exc:
+                parser_error = None
+                error_code = "backend_error"
+                backend_error = BackendError(
+                    "Speech parser backend raised an unexpected exception.",
+                    retryable=False,
+                    details={"cause_type": type(exc).__name__},
+                )
+                error = f"{type(backend_error).__name__}: {backend_error}"
+                break
         return SpeechParseResult(
             status="failed",
             events=(),
             raw_text=tuple(raw_text),
             error=error or "speech parsing failed",
             error_code=error_code or "backend_error",
-            attempts=2,
+            attempts=attempt,
             model=self.model,
         )

@@ -129,6 +129,13 @@ protocols:
   registered aliases, distinguishes evidence and certainty semantics, constrains
   action-position extraction, and includes eleven fixed Chinese JSON few-shots.
 
+The Speech Parser maps public utterances to this manually defined controlled
+event set; it does not decide whether a player's statement is true, mistaken,
+or deceptive. `evidence_source` is an optional auxiliary qualifier, and an
+ambiguous canonical value is not a fatal collection condition. Downstream ToM
+models learn the social reasoning relationships rather than receiving them from
+keyword rules.
+
 Natural-language instructions are Chinese, while machine-readable JSON keys
 (`speech`, `action_index`, `wolf_pair`), role/camp values, event families,
 `content.kind`/`content.value`, and qualifier enums remain in English.
