@@ -16,9 +16,10 @@ from werewolf.events.encoder import (
 from werewolf.events.streams import (
     knowledge_for_player,
     public_events,
-    render_stream,
+    render_information_partitions,
     visible_events,
 )
+from werewolf.game_rules import canonical_ruleset_metadata
 from werewolf.prompt_protocol import PARSER_PROMPT_SPEC
 from werewolf.tom.masks import (
     first_order_constraints,
@@ -152,15 +153,22 @@ def build_audit_report(
     runtime_model_distribution = Counter()
     missing_prompt_protocol_count = 0
     invalid_prompt_protocol_count = 0
+    ruleset_ids = set()
+    ruleset_versions = set()
+    ruleset_hashes = set()
+    missing_ruleset_count = 0
+    invalid_ruleset_count = 0
 
     for record in records:
         if not isinstance(record, dict):
             schema_errors += 1
             missing_prompt_protocol_count += 1
+            missing_ruleset_count += 1
             continue
         prompt_protocol = record.get("prompt_protocol")
         if prompt_protocol is None:
             missing_prompt_protocol_count += 1
+            missing_ruleset_count += 1
         else:
             protocol_id = prompt_protocol.get("protocol_id") if isinstance(
                 prompt_protocol, dict
@@ -168,6 +176,20 @@ def build_audit_report(
             if isinstance(protocol_id, str):
                 prompt_protocol_distribution[protocol_id] += 1
             if isinstance(prompt_protocol, dict):
+                ruleset = prompt_protocol.get("ruleset")
+                if ruleset is None:
+                    missing_ruleset_count += 1
+                elif isinstance(ruleset, dict):
+                    if isinstance(ruleset.get("id"), str):
+                        ruleset_ids.add(ruleset["id"])
+                    if isinstance(ruleset.get("version"), str):
+                        ruleset_versions.add(ruleset["version"])
+                    if isinstance(ruleset.get("sha256"), str):
+                        ruleset_hashes.add(ruleset["sha256"])
+                    if ruleset != canonical_ruleset_metadata():
+                        invalid_ruleset_count += 1
+                else:
+                    invalid_ruleset_count += 1
                 for name, versions, hashes in (
                     ("gameplay", gameplay_prompt_versions, gameplay_prompt_hashes),
                     ("belief", belief_prompt_versions, belief_prompt_hashes),
@@ -599,6 +621,11 @@ def build_audit_report(
         "belief_prompt_hashes": sorted(belief_prompt_hashes),
         "parser_prompt_hashes": sorted(parser_prompt_hashes),
         "runtime_model_distribution": _distribution(runtime_model_distribution),
+        "ruleset_ids": sorted(ruleset_ids),
+        "ruleset_versions": sorted(ruleset_versions),
+        "ruleset_hashes": sorted(ruleset_hashes),
+        "missing_ruleset_count": missing_ruleset_count,
+        "invalid_ruleset_count": invalid_ruleset_count,
         "missing_prompt_protocol_count": missing_prompt_protocol_count,
         "invalid_prompt_protocol_count": invalid_prompt_protocol_count,
     }
@@ -617,6 +644,8 @@ def assert_audit_passes(report):
         "unknown_value_count",
         "missing_prompt_protocol_count",
         "invalid_prompt_protocol_count",
+        "missing_ruleset_count",
+        "invalid_ruleset_count",
         "belief_contains_observer_failures",
         "belief_success_constraint_violations",
         "missing_parser_metadata_count",
@@ -628,6 +657,9 @@ def assert_audit_passes(report):
         "gameplay_prompt_hashes",
         "belief_prompt_hashes",
         "parser_prompt_hashes",
+        "ruleset_ids",
+        "ruleset_versions",
+        "ruleset_hashes",
     ):
         values = report.get(field, [])
         if len(values) != 1:
@@ -738,7 +770,7 @@ class ToMCollector:
             known_wolves=knowledge["known_wolves"],
             known_good=knowledge["known_good"],
         )
-        view = render_stream(visible_events(events, target_id))
+        view = render_information_partitions(events, player_id=target_id)
         return self.guess_provider_for(target_id).elicit(
             observer_id=target_id,
             player_view=view,

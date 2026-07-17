@@ -5,6 +5,7 @@ import re
 
 from werewolf.events.schema import validate_event
 from werewolf.events.streams import knowledge_for_player
+from werewolf.game_rules import canonical_ruleset_metadata
 from werewolf.prompt_protocol import (
     PROMPT_LANGUAGE,
     PROMPT_NAMES,
@@ -65,12 +66,14 @@ PROMPT_PROTOCOL_FIELDS = {
     "protocol_version",
     "language",
     "protocol_id",
+    "ruleset",
     "gameplay",
     "belief",
     "parser",
     "runtime",
 }
 PROMPT_REFERENCE_FIELDS = {"version", "sha256"}
+RULESET_REFERENCE_FIELDS = {"id", "version", "sha256"}
 RUNTIME_FIELDS = {"gameplay_profiles", "belief_profiles", "parser"}
 RUNTIME_MODEL_FIELDS = {"backend", "model", "temperature"}
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -90,11 +93,16 @@ def _validate_runtime_model(value, name):
 
 def validate_prompt_protocol(prompt_protocol) -> bool:
     if not isinstance(prompt_protocol, dict) or set(prompt_protocol) != PROMPT_PROTOCOL_FIELDS:
-        raise ValueError("prompt_protocol fields do not match prompt_protocol.zh.v1")
+        raise ValueError("prompt_protocol fields do not match prompt_protocol.zh.v2")
     if prompt_protocol["protocol_version"] != PROMPT_PROTOCOL_VERSION:
         raise ValueError("unsupported prompt_protocol version")
     if prompt_protocol["language"] != PROMPT_LANGUAGE:
         raise ValueError("prompt_protocol.language must be zh-CN")
+    ruleset = prompt_protocol["ruleset"]
+    if not isinstance(ruleset, dict) or set(ruleset) != RULESET_REFERENCE_FIELDS:
+        raise ValueError("prompt_protocol.ruleset fields are invalid")
+    if ruleset != canonical_ruleset_metadata():
+        raise ValueError("prompt_protocol.ruleset does not match the canonical ruleset")
     references = {}
     for name in PROMPT_NAMES:
         reference = prompt_protocol[name]
@@ -116,6 +124,7 @@ def validate_prompt_protocol(prompt_protocol) -> bool:
         raise ValueError("prompt_protocol.protocol_id is invalid")
     expected_id = protocol_id_from_references(
         references,
+        ruleset=ruleset,
         protocol_version=prompt_protocol["protocol_version"],
         language=prompt_protocol["language"],
     )

@@ -4,7 +4,13 @@ import json
 from dataclasses import dataclass
 
 from werewolf.events.schema import make_event, normalize_content
-from werewolf.prompt_protocol import PARSER_PROMPT_SPEC
+from werewolf.prompt_protocol import (
+    PARSER_PROMPT_SPEC,
+    PARSER_SYSTEM_PROMPT,
+    parser_few_shot_messages,
+    parser_repair_message,
+    render_parser_user_message,
+)
 
 
 SPEECH_FAMILIES = (
@@ -29,7 +35,7 @@ PARSED_EVENT_FIELDS = {
     "parser_confidence",
 }
 
-SYSTEM_PROMPT = PARSER_PROMPT_SPEC["text"]
+SYSTEM_PROMPT = PARSER_SYSTEM_PROMPT
 
 
 @dataclass(frozen=True)
@@ -211,11 +217,10 @@ class SpeechEventParser:
         raw_text = []
         error = None
         error_code = None
-        user_content = json.dumps(
-            {"speaker": speaker, "utterance": utterance}, ensure_ascii=False
-        )
+        user_content = render_parser_user_message(speaker, utterance)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
+            *parser_few_shot_messages(),
             {"role": "user", "content": user_content},
         ]
         for attempt in range(1, 3):
@@ -228,7 +233,7 @@ class SpeechEventParser:
                         },
                         {
                             "role": "user",
-                            "content": "你的上一条回复不符合 schema。只返回修正后的有效 JSON。",
+                            "content": parser_repair_message(),
                         },
                     ]
                 )

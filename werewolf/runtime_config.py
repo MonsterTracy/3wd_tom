@@ -3,6 +3,8 @@
 from copy import deepcopy
 from pathlib import Path
 
+from werewolf.game_rules import NUM_PLAYERS, NUM_WEREWOLVES, ROLE_DISTRIBUTIONS
+
 
 RUNTIME_SCHEMA_VERSION = "runtime.v1"
 BACKEND_FIELDS = {"type", "base_url", "api_key_env", "default_model"}
@@ -98,12 +100,13 @@ def validate_runtime_config(config):
             raise ValueError(f"agents.{assignment} does not exist")
 
     environment = config["environment"]
+    canonical_roles = ROLE_DISTRIBUTIONS["seer_witch"]
     required_environment = {
-        "n_player": 7,
-        "n_role": 4,
-        "n_werewolf": 2,
-        "n_seer": 1,
-        "n_villager": 3,
+        "n_player": NUM_PLAYERS,
+        "n_role": sum(count > 0 for count in canonical_roles.values()),
+        "n_werewolf": NUM_WEREWOLVES,
+        "n_seer": canonical_roles["Seer"],
+        "n_villager": canonical_roles["Villager"],
         "n_hunter": 0,
     }
     expected_environment_fields = set(required_environment) | {

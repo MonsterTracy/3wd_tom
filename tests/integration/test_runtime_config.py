@@ -12,8 +12,10 @@ import yaml
 import script.tom.collect as collect_module
 from script.tom.collect import collect_from_config, preflight_collection
 from werewolf.prompt_protocol import (
+    BELIEF_SYSTEM_PROMPT,
     BELIEF_PROMPT_SPEC,
     GAMEPLAY_PROMPT_SPEC,
+    PARSER_SYSTEM_PROMPT,
     PARSER_PROMPT_SPEC,
     protocol_id_from_references,
 )
@@ -173,7 +175,7 @@ class DeterministicFakeBackend:
 
     def chat(self, messages, **kwargs):
         system = messages[0]["content"] if messages[0]["role"] == "system" else ""
-        if system == PARSER_PROMPT_SPEC["text"]:
+        if system == PARSER_SYSTEM_PROMPT:
             self.parser_calls += 1
             if self.parser_calls == 1:
                 return '{"events":[]}'
@@ -183,7 +185,7 @@ class DeterministicFakeBackend:
                 '"ref_event_id":null,"source_span":"确定性发言",'
                 '"parser_confidence":1.0}]}'
             )
-        if system == BELIEF_PROMPT_SPEC["text"]:
+        if system == BELIEF_SYSTEM_PROMPT:
             view = messages[1]["content"]
             self_role = next(
                 line for line in view.splitlines() if "kind=SELF_ROLE" in line
@@ -208,9 +210,10 @@ class DeterministicFakeBackend:
                 if known_wolves.issubset(pair) and known_good.isdisjoint(pair)
             )
             return json.dumps({"wolf_pair": pair})
-        assert system == GAMEPLAY_PROMPT_SPEC["text"]
+        assert "【游戏规则】" in system
+        assert "【当前角色规则】" in system
         prompt = messages[1]["content"]
-        if '{"speech":"你的公开发言"}' in prompt:
+        if '{"speech":"..."}' in prompt:
             return '{"speech":"确定性发言"}'
         return '{"action_index":1}'
 
@@ -297,6 +300,11 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     }
     assert audit["missing_prompt_protocol_count"] == 0
     assert audit["invalid_prompt_protocol_count"] == 0
+    assert audit["ruleset_ids"] == [protocol["ruleset"]["id"]]
+    assert audit["ruleset_versions"] == [protocol["ruleset"]["version"]]
+    assert audit["ruleset_hashes"] == [protocol["ruleset"]["sha256"]]
+    assert audit["missing_ruleset_count"] == 0
+    assert audit["invalid_ruleset_count"] == 0
     parser_events = [
         event
         for sample in samples
@@ -305,7 +313,7 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     ]
     assert parser_events
     assert all(
-        event["metadata"]["parser_protocol"]["version"] == "parser.zh.v1"
+        event["metadata"]["parser_protocol"]["version"] == "parser.zh.v2"
         and event["metadata"]["parser_protocol"]["sha256"]
         == PARSER_PROMPT_SPEC["sha256"]
         and event["metadata"]["parser_protocol"]["model"] == "deepseek-chat"
@@ -337,7 +345,7 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert log_records
     assert all(
         record["gameplay_prompt"] == {
-            "version": "gameplay.zh.v1",
+            "version": "gameplay.zh.v2",
             "sha256": GAMEPLAY_PROMPT_SPEC["sha256"],
         }
         and record["model"] == "deepseek-chat"

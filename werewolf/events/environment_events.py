@@ -1,9 +1,10 @@
 """Deterministic environment event builders; no LLM parsing occurs here."""
 
 from werewolf.events.schema import make_event
+from werewolf.game_rules import PLAYER_IDS
 
 
-ALL_PLAYERS = list(range(1, 8))
+ALL_PLAYERS = list(PLAYER_IDS)
 
 
 def game_event(

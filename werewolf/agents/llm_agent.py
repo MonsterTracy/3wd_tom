@@ -6,12 +6,20 @@ from pathlib import Path
 
 from werewolf.agents.base_agent import Agent
 from werewolf.backends.base import BackendError
-from werewolf.events.streams import render_stream
-from werewolf.prompt_protocol import GAMEPLAY_PROMPT_SPEC, prompt_reference
+from werewolf.events.streams import (
+    alive_players_from_events,
+    render_information_partitions,
+)
+from werewolf.game_rules import variant_from_role_counts
+from werewolf.prompt_protocol import (
+    GAMEPLAY_PROMPT_SPEC,
+    build_gameplay_system_prompt,
+    gameplay_repair_message,
+    prompt_reference,
+    render_gameplay_phase_task,
+    render_gameplay_user_message,
+)
 from werewolf.tom.guess_provider import BeliefGuessProvider
-
-
-GAMEPLAY_SYSTEM_PROMPT = GAMEPLAY_PROMPT_SPEC["text"]
 
 
 class LLMAgent(Agent):
@@ -43,33 +51,53 @@ class LLMAgent(Agent):
         del observation
         return ""
 
+    @staticmethod
+    def _variant(observation):
+        for event in observation["events"]:
+            if (
+                event["event_family"] == "GAME_EVENT"
+                and event["content"]["kind"] == "SETTING"
+            ):
+                return variant_from_role_counts(event["metadata"]["roles"])
+        if observation["role"] == "Guard":
+            return "seer_guard"
+        return "seer_witch"
+
     def format_observation(self, observation):
-        actions = observation["valid_actions"]
-        speech_phase = "speech" in observation["phase"]
-        output_instruction = (
-            '发言阶段只返回如下 JSON：{"speech":"你的公开发言"}。'
-            if speech_phase
-            else (
-                "从 valid_actions 中选择一个从零开始的索引，且只返回如下 JSON："
-                '{"action_index":0}。'
-            )
+        phase = observation["phase"]
+        role = observation["role"]
+        player_id = observation["player_id"]
+        variant = self._variant(observation)
+        day = observation.get("day")
+        if day is None:
+            prefix = phase.split("_", 1)[0]
+            day = int(prefix) if prefix.isdigit() else 0
+        alive_players = observation.get(
+            "alive_players", alive_players_from_events(observation["events"])
         )
-        return "\n\n".join(
-            part
-            for part in (
-                f"你是玩家 {observation['player_id']}，当前身份是 {observation['role']}。",
-                f"当前阶段：{observation['phase']}",
-                self.strategy_hint(observation),
-                "当前可见事件：\n" + render_stream(observation["events"]),
-                "valid_actions=" + json.dumps(actions, ensure_ascii=False),
-                output_instruction,
-            )
-            if part
+        information = render_information_partitions(
+            observation["events"], player_id=player_id
+        )
+        return render_gameplay_user_message(
+            player_id=player_id,
+            role=role,
+            phase=phase,
+            day=day,
+            alive_players=alive_players,
+            information=information,
+            valid_actions=observation["valid_actions"],
+            phase_task=render_gameplay_phase_task(role, phase, variant),
         )
 
     def build_messages(self, observation):
+        variant = self._variant(observation)
         return [
-            {"role": "system", "content": GAMEPLAY_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": build_gameplay_system_prompt(
+                    observation["role"], variant
+                ),
+            },
             {"role": "user", "content": self.format_observation(observation)},
         ]
 
@@ -123,7 +151,7 @@ class LLMAgent(Agent):
                         {"role": "assistant", "content": responses[-1] if responses else ""},
                         {
                             "role": "user",
-                            "content": "只返回符合当前阶段要求的有效 JSON，不要输出其他内容。",
+                            "content": gameplay_repair_message(),
                         },
                     ]
                 )

@@ -3,11 +3,15 @@
 import json
 from dataclasses import dataclass
 
-from werewolf.prompt_protocol import BELIEF_PROMPT_SPEC
+from werewolf.prompt_protocol import (
+    BELIEF_SYSTEM_PROMPT,
+    belief_repair_message,
+    render_belief_user_message,
+)
 from werewolf.tom.pair_space import PLAYER_IDS, pair_index, validate_pair_mask
 
 
-SYSTEM_PROMPT = BELIEF_PROMPT_SPEC["text"]
+SYSTEM_PROMPT = BELIEF_SYSTEM_PROMPT
 GUESS_ERROR_CODES = {
     "backend_error",
     "invalid_json",
@@ -109,44 +113,27 @@ def parse_guess_response(text: str) -> tuple[int, int]:
 
 
 def _user_message(*, observer_id, player_view, required_wolves, forbidden_wolves):
-    required = json.dumps(list(required_wolves), ensure_ascii=False)
-    forbidden = json.dumps(list(forbidden_wolves), ensure_ascii=False)
-    return (
-        f"当前被测玩家：{observer_id}号\n\n"
-        "必须遵守的硬约束：\n"
-        "- 必须选择两名不同玩家；\n"
-        f"- 禁止选择的玩家：{forbidden}\n"
-        f"- 已知必须包含的狼人：{required}\n"
-        f"- 已知不是狼人的玩家：{forbidden}\n\n"
-        "当前合法视角：\n"
-        f"{player_view}"
+    expected = {
+        "private_facts", "public_game_events", "public_player_claims"
+    }
+    if not isinstance(player_view, dict) or set(player_view) != expected:
+        raise ValueError("player_view must contain the three information partitions")
+    if any(not isinstance(player_view[name], str) for name in expected):
+        raise ValueError("player_view partitions must be rendered text")
+    return render_belief_user_message(
+        observer_id=observer_id,
+        information=player_view,
+        required_wolves=required_wolves,
+        forbidden_wolves=forbidden_wolves,
+        valid_player_ids=PLAYER_IDS,
     )
 
 
 def _repair_message(error_code, *, required_wolves, forbidden_wolves):
-    required = json.dumps(list(required_wolves), ensure_ascii=False)
-    forbidden = json.dumps(list(forbidden_wolves), ensure_ascii=False)
-    reasons = {
-        "invalid_json": "上一条结果非法：回复不是规定的 JSON 对象。",
-        "not_exactly_two_players": "上一条结果非法：必须恰好选择两名玩家。",
-        "duplicate_players": "上一条结果非法：两名玩家不能相同。",
-        "out_of_range": "上一条结果非法：玩家编号必须是 1 到 7 的整数。",
-        "missing_required_wolf": (
-            "上一条结果非法：组合遗漏了已知必须包含的狼人。"
-            f"\n已知必须包含的狼人为：{required}。"
-        ),
-        "contains_forbidden_player": (
-            "上一条结果非法：组合包含了已知不是狼人的玩家。"
-            f"\n禁止选择的玩家为：{forbidden}。"
-        ),
-        "label_outside_mask": "上一条结果非法：组合不满足当前硬约束。",
-    }
-    reason = reasons.get(error_code, "上一条请求未成功完成。")
-    return (
-        f"{reason}\n"
-        f"已知必须包含的狼人：{required}。\n"
-        f"禁止选择的玩家：{forbidden}。\n"
-        "请只返回满足这些硬约束的合法 JSON。"
+    return belief_repair_message(
+        error_code,
+        required_wolves=required_wolves,
+        forbidden_wolves=forbidden_wolves,
     )
 
 

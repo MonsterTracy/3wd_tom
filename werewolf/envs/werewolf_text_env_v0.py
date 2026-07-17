@@ -22,18 +22,26 @@ from werewolf.events.environment_events import (
     wolf_team_event,
 )
 from werewolf.events.streams import visible_events
+from werewolf.game_rules import (
+    NUM_PLAYERS,
+    NUM_WEREWOLVES,
+    PLAYER_IDS,
+    ROLE_ABILITIES,
+    ROLE_DISTRIBUTIONS,
+    validate_role_distribution,
+)
 
 
-SUPPORTED_ROLES = {"Werewolf", "Seer", "Witch", "Guard", "Villager"}
+SUPPORTED_ROLES = set(ROLE_ABILITIES)
 
 
 class WerewolfTextEnvV0:
     """Fixed 2-wolf/1-seer/3-villager/1-witch-or-guard game."""
 
     def __init__(self, **kwargs):
-        self.n_player = kwargs.get("n_player", 7)
+        self.n_player = kwargs.get("n_player", NUM_PLAYERS)
         self.n_role = kwargs.get("n_role", 4)
-        self.n_werewolf = kwargs.get("n_werewolf", 2)
+        self.n_werewolf = kwargs.get("n_werewolf", NUM_WEREWOLVES)
         self.n_seer = kwargs.get("n_seer", 1)
         self.n_guard = kwargs.get("n_guard", 0)
         self.n_witch = kwargs.get("n_witch", 1)
@@ -60,12 +68,13 @@ class WerewolfTextEnvV0:
         self.parser_failures = []
 
     def _validate_7p_config(self):
+        canonical = ROLE_DISTRIBUTIONS["seer_witch"]
         fixed = {
-            "n_player": 7,
-            "n_role": 4,
-            "n_werewolf": 2,
-            "n_seer": 1,
-            "n_villager": 3,
+            "n_player": NUM_PLAYERS,
+            "n_role": sum(count > 0 for count in canonical.values()),
+            "n_werewolf": NUM_WEREWOLVES,
+            "n_seer": canonical["Seer"],
+            "n_villager": canonical["Villager"],
             "n_hunter": 0,
         }
         for name, expected in fixed.items():
@@ -79,15 +88,15 @@ class WerewolfTextEnvV0:
 
     @staticmethod
     def _validate_roles(roles):
-        if len(roles) != 7:
+        if len(roles) != NUM_PLAYERS:
             raise ValueError("roles must contain exactly seven entries")
         counts = Counter(roles)
         if set(counts) - SUPPORTED_ROLES:
             raise ValueError(f"unsupported roles: {sorted(set(counts) - SUPPORTED_ROLES)}")
-        if counts["Werewolf"] != 2 or counts["Seer"] != 1 or counts["Villager"] != 3:
-            raise ValueError("roles require two wolves, one seer, and three villagers")
-        if counts["Witch"] + counts["Guard"] != 1:
-            raise ValueError("roles require exactly one witch or guard")
+        try:
+            validate_role_distribution(roles)
+        except ValueError as exc:
+            raise ValueError("roles do not match a supported seven-player variant") from exc
 
     def set_tom_collector(self, collector):
         self.tom_collector = collector
@@ -130,11 +139,11 @@ class WerewolfTextEnvV0:
             self.rng.shuffle(roles)
         self._validate_roles(roles)
         self.roles = roles
-        self.wolves = [player_id for player_id in range(1, 8) if self._role(player_id) == "Werewolf"]
+        self.wolves = [player_id for player_id in PLAYER_IDS if self._role(player_id) == "Werewolf"]
         self.seer = self.roles.index("Seer") + 1
         self.guard = self.roles.index("Guard") + 1 if "Guard" in self.roles else None
         self.witch = self.roles.index("Witch") + 1 if "Witch" in self.roles else None
-        self.alive = set(range(1, 8))
+        self.alive = set(PLAYER_IDS)
         self.day = 0
         self.day_or_night = "night"
         self.phase = "init"
@@ -162,8 +171,8 @@ class WerewolfTextEnvV0:
             value=None,
             metadata={
                 "roles": dict(Counter(self.roles)),
-                "players": 7,
-                "wolves": 2,
+                "players": NUM_PLAYERS,
+                "wolves": NUM_WEREWOLVES,
             },
         )
         for player_id, role in enumerate(self.roles, start=1):

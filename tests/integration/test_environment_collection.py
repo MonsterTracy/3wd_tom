@@ -17,6 +17,19 @@ from werewolf.events.environment_events import (
 )
 from werewolf.events.speech_parser import SpeechEventParser
 from werewolf.events.streams import public_events, visible_events
+from werewolf.game_rules import (
+    LEGAL_TARGET_RULES,
+    NUM_PLAYERS,
+    NUM_WEREWOLVES,
+    PASS_RULES,
+    PHASE_ORDER,
+    ROLE_DISTRIBUTIONS,
+    TIE_RULES,
+    VICTORY_RULES,
+    canonical_ruleset_metadata,
+    ruleset_sha256,
+    validate_role_distribution,
+)
 from werewolf.prompt_protocol import build_prompt_protocol, protocol_id_from_references
 from werewolf.tom.collection import (
     JsonlSink,
@@ -311,6 +324,8 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         "belief_prompt_hashes", "parser_prompt_hashes",
         "runtime_model_distribution", "missing_prompt_protocol_count",
         "invalid_prompt_protocol_count",
+        "ruleset_ids", "ruleset_versions", "ruleset_hashes",
+        "missing_ruleset_count", "invalid_ruleset_count",
     }
     assert required <= set(report)
     assert report["games"] == 1
@@ -334,9 +349,16 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["prompt_protocol_distribution"] == {
         records[0]["prompt_protocol"]["protocol_id"]: 2
     }
-    assert report["gameplay_prompt_versions"] == ["gameplay.zh.v1"]
-    assert report["belief_prompt_versions"] == ["belief.zh.v1"]
-    assert report["parser_prompt_versions"] == ["parser.zh.v1"]
+    assert report["gameplay_prompt_versions"] == ["gameplay.zh.v2"]
+    assert report["belief_prompt_versions"] == ["belief.zh.v2"]
+    assert report["parser_prompt_versions"] == ["parser.zh.v2"]
+    assert report["ruleset_ids"] == ["werewolf_7p"]
+    assert report["ruleset_versions"] == ["werewolf_7p.zh.v1"]
+    assert report["ruleset_hashes"] == [
+        records[0]["prompt_protocol"]["ruleset"]["sha256"]
+    ]
+    assert report["missing_ruleset_count"] == 0
+    assert report["invalid_ruleset_count"] == 0
     assert report["missing_prompt_protocol_count"] == 0
     assert report["invalid_prompt_protocol_count"] == 0
     assert report["speech_event_count"] == 0
@@ -398,6 +420,23 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert missing_protocol_report["missing_prompt_protocol_count"] == 1
     with pytest.raises(RuntimeError, match="missing_prompt_protocol_count"):
         assert_audit_passes(missing_protocol_report)
+
+    forged_ruleset = deepcopy(records)
+    forged_ruleset[0]["prompt_protocol"]["ruleset"]["sha256"] = "0" * 64
+    forged_references = {
+        name: forged_ruleset[0]["prompt_protocol"][name]
+        for name in ("gameplay", "belief", "parser")
+    }
+    forged_ruleset[0]["prompt_protocol"]["protocol_id"] = (
+        protocol_id_from_references(
+            forged_references,
+            ruleset=forged_ruleset[0]["prompt_protocol"]["ruleset"],
+        )
+    )
+    forged_ruleset_report = build_audit_report(forged_ruleset)
+    assert forged_ruleset_report["invalid_ruleset_count"] == 1
+    with pytest.raises(RuntimeError, match="invalid_ruleset_count"):
+        assert_audit_passes(forged_ruleset_report)
 
     mixed_protocol = deepcopy(records)
     mixed_protocol[1]["prompt_protocol"]["belief"]["sha256"] = "0" * 64
@@ -486,7 +525,7 @@ def test_fixed_seven_player_roles_and_both_win_conditions():
     assert environment.roles.count("Villager") == 3
     assert environment.events[0]["content"] == {"kind": "SETTING", "value": None}
     assert environment.events[0]["metadata"]["roles"]["Werewolf"] == 2
-    with pytest.raises(ValueError, match="two wolves"):
+    with pytest.raises(ValueError, match="supported seven-player variant"):
         environment.reset(
             roles=["Werewolf", "Seer", "Seer", "Witch", "Villager", "Villager", "Villager"]
         )
@@ -501,6 +540,51 @@ def test_fixed_seven_player_roles_and_both_win_conditions():
     wolf_reward, wolf_done, wolf_info = environment._is_done()
     assert wolf_done and wolf_info == {"Werewolf": 1}
     assert wolf_reward[0] == environment.werewolf_reward
+
+
+def test_canonical_ruleset_matches_environment_counts_actions_and_outcomes():
+    metadata = canonical_ruleset_metadata()
+    assert metadata == canonical_ruleset_metadata()
+    assert metadata["sha256"] == ruleset_sha256()
+    assert len(metadata["sha256"]) == 64
+    assert NUM_PLAYERS == 7
+    assert NUM_WEREWOLVES == 2
+    assert ROLE_DISTRIBUTIONS["seer_witch"] == {
+        "Werewolf": 2, "Seer": 1, "Witch": 1, "Guard": 0,
+        "Villager": 3,
+    }
+    assert ROLE_DISTRIBUTIONS["seer_guard"] == {
+        "Werewolf": 2, "Seer": 1, "Witch": 0, "Guard": 1,
+        "Villager": 3,
+    }
+    assert validate_role_distribution(ROLES, "seer_witch")
+    assert PHASE_ORDER["seer_witch"][:3] == (
+        "skill_wolf", "skill_seer", "skill_witch"
+    )
+    assert PHASE_ORDER["seer_guard"][:3] == (
+        "skill_wolf", "skill_seer", "skill_guard"
+    )
+
+    environment = WerewolfTextEnvV0(random_seed=13)
+    observation = environment.reset(roles=ROLES)
+    assert environment.n_player == NUM_PLAYERS
+    assert environment.n_werewolf == NUM_WEREWOLVES
+    assert ("kill", 0) in observation["valid_actions"]
+    assert PASS_RULES["skill_wolf"]
+    assert {target for action, target in observation["valid_actions"] if target} == {
+        3, 4, 5, 6, 7
+    }
+    assert "存活的非狼人" in LEGAL_TARGET_RULES["skill_wolf"]
+
+    environment.step(("kill", 0))
+    observation, _, _, _ = environment.step(("kill", 0))
+    assert ("check", 0) in observation["valid_actions"]
+    assert all(target != 3 for _, target in observation["valid_actions"])
+    assert PASS_RULES["skill_seer"]
+    assert "PK" in TIE_RULES["first_vote"]
+    assert "无人被放逐" in TIE_RULES["pk_vote"]
+    assert "存活狼人数量变为零" in VICTORY_RULES["Village"]
+    assert "存活普通村民数量变为零" in VICTORY_RULES["Werewolf"]
 
 
 def test_night_order_seer_witch_death_and_private_visibility():
@@ -572,6 +656,40 @@ def test_seer_village_check_has_canonical_target_value_and_private_visibility():
         not any(event["content"]["kind"] == "CHECK_RESULT" for event in visible_events(environment.events, player_id))
         for player_id in (1, 2, 4, 5, 6, 7)
     )
+
+
+def test_seer_pass_witch_self_heal_single_action_and_guard_target_rules():
+    witch_environment = WerewolfTextEnvV0(random_seed=7)
+    witch_environment.reset(roles=ROLES)
+    witch_environment.step(("kill", 4))
+    witch_environment.step(("kill", 4))
+    witch_environment.step(("check", 0))
+    assert not any(
+        event["content"]["kind"] == "CHECK_RESULT"
+        for event in witch_environment.events
+    )
+    actions = witch_environment.valid_actions()
+    assert ("witch_heal", 4) in actions
+    assert any(action == "witch_poison" for action, _ in actions)
+    witch_environment.step(("witch_heal", 4))
+    assert witch_environment.phase == "speech"
+    assert 4 in witch_environment.alive
+
+    guard_roles = [
+        "Werewolf", "Werewolf", "Seer", "Guard",
+        "Villager", "Villager", "Villager",
+    ]
+    guard_environment = WerewolfTextEnvV0(
+        random_seed=8, n_witch=0, n_guard=1
+    )
+    guard_environment.reset(roles=guard_roles)
+    guard_environment.step(("kill", 0))
+    guard_environment.step(("kill", 0))
+    guard_environment.step(("check", 0))
+    assert ("guard", 4) in guard_environment.valid_actions()
+    guard_environment.guard_history = [4]
+    assert ("guard", 4) not in guard_environment.valid_actions()
+    assert ("guard", 0) in guard_environment.valid_actions()
 
 
 def test_guard_variant_protects_at_night_and_records_private_result():

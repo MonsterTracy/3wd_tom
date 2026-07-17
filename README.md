@@ -105,34 +105,41 @@ refuses any path that already exists. Generated JSON/JSONL under `data/tom/` is
 ignored by Git. If the audit fails, samples, failures, and audit output remain in
 that directory for diagnosis, so do not reuse an old pilot directory.
 
-## Prompt Protocol V1
+## Ruleset and Prompt Protocol V2
 
-`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V1. Its formal
+`werewolf/game_rules.py` is the sole machine-readable game-rule source. The
+current ruleset is `werewolf_7p.zh.v1` (`id: werewolf_7p`) and covers both
+supported seven-player variants, `seer_witch` and `seer_guard`. Prompt text
+renders rules from that module; this README intentionally does not duplicate
+the complete rules.
+
+`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V2. Its formal
 instruction language is Chinese (`language: zh-CN`) and it has three canonical
-templates:
+protocols:
 
-- `gameplay.zh.v1` gives the agent stable rules, legal-information boundaries,
-  evidence-quality guidance, and prompt-injection isolation. The current player
-  view, legal actions, strategy hint, and output schema remain in a dynamic user
-  message.
-- `belief.zh.v1` measures one player's private joint MAP belief over the complete
-  two-Werewolf pair. It does not continue gameplay or request reasoning.
-- `parser.zh.v1` extracts only explicit local speech semantics into the existing
-  controlled event vocabulary. Utterances are treated as untrusted game data.
+- `gameplay.zh.v2` layers rendered global rules, current-role rules, visibility
+  boundaries, and phase tasks. Its dynamic message separates confirmed private
+  facts, public objective events, and untrusted public player claims.
+- `belief.zh.v2` measures one player's private joint MAP belief over the complete
+  two-Werewolf pair from the same three information partitions. It does not
+  continue gameplay, affect later actions, or request reasoning.
+- `parser.zh.v2` extracts only explicit local speech semantics into the existing
+  controlled event vocabulary and includes six fixed Chinese JSON few-shots.
 
 Natural-language instructions are Chinese, while machine-readable JSON keys
 (`speech`, `action_index`, `wolf_pair`), role/camp values, event families,
 `content.kind`/`content.value`, and qualifier enums remain in English.
 
-Each template is normalized to LF line endings and hashed with SHA-256. The
-stable hashes and derived `protocol_id` describe static prompt templates only;
-they exclude dynamic player views, event history, hidden roles, wolf teams, and
-credentials. Prompt versions and hashes are written to `tom.v1_1` samples,
-collection audits, parser event metadata, gameplay logs, and model checkpoints.
-Changing canonical Chinese prompt text requires incrementing its version and
-recollecting the affected data. Chinese- and English-protocol records must not
-be mixed without explicit protocol metadata; the strict loader rejects the old
-English protocol rather than adapting it.
+Each complete stable protocol is normalized to LF line endings and hashed with
+SHA-256. Gameplay covers system/user structures, role/phase/output/repair
+templates and the ruleset reference; belief covers system/user/constraint/
+output/repair structures and the ruleset reference; parser covers its system,
+controlled enums, user/repair structures, and every few-shot. Dynamic values,
+event history, model responses, and credentials are excluded. The derived
+`protocol_id` also includes the ruleset ID, version, and hash. These references
+are written to `tom.v1_1` samples, audits, parser metadata, gameplay logs, and
+checkpoints. The strict loader rejects Prompt Protocol V1 rather than adapting
+it.
 
 Prompt metadata is a data-generation condition, not a model feature. A trained
 model therefore represents the behavior distribution induced by its recorded
@@ -156,7 +163,8 @@ cross-entropy objective.
 Only successful `tom.v1_1` JSONL records are trainable. Each record names its
 task/mode/checkpoint, carries the exact input events and 21-way output mask, and
 stores the elicited pair/index plus raw elicitation metadata and one required
-`prompt_protocol` object. Failed records carry the same protocol object and are
+`prompt_protocol` object containing the unique `ruleset` reference. Failed
+records carry the same protocol object and are
 kept separately with raw responses and errors. The loader deliberately rejects
 older schemas and mixed-protocol files; ground-truth role vectors cannot be
 converted into subjective guesses.

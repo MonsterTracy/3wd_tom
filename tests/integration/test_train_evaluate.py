@@ -77,16 +77,19 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     )
     assert checkpoint["prompt_protocol"]["prompt_language"] == "zh-CN"
     assert checkpoint["prompt_protocol"]["prompt_protocol_version"] == (
-        "prompt_protocol.zh.v1"
+        "prompt_protocol.zh.v2"
     )
     assert checkpoint["prompt_protocol"]["gameplay_prompt_version"] == (
-        "gameplay.zh.v1"
+        "gameplay.zh.v2"
     )
     assert checkpoint["prompt_protocol"]["belief_prompt_version"] == (
-        "belief.zh.v1"
+        "belief.zh.v2"
     )
     assert checkpoint["prompt_protocol"]["parser_prompt_version"] == (
-        "parser.zh.v1"
+        "parser.zh.v2"
+    )
+    assert checkpoint["prompt_protocol"]["ruleset"] == (
+        first_order["prompt_protocol"]["ruleset"]
     )
     evaluation_path = tmp_path / "evaluation.json"
     evaluation = evaluate_from_config(
@@ -124,6 +127,23 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
                 "device": "cpu",
                 "include_first_order_private": True,
                 "output": str(tmp_path / "mismatch-evaluation.json"),
+            }
+        )
+
+    ruleset_mismatch = deepcopy(checkpoint)
+    ruleset_mismatch["prompt_protocol"]["ruleset"]["sha256"] = "0" * 64
+    mismatched_checkpoint = tmp_path / "ruleset-mismatch.pt"
+    torch.save(ruleset_mismatch, mismatched_checkpoint)
+    with pytest.raises(ValueError, match="prompt protocol"):
+        evaluate_from_config(
+            {
+                "schema_version": "evaluate.v1",
+                "checkpoint": str(mismatched_checkpoint),
+                "data_paths": [str(valid_path)],
+                "batch_size": 2,
+                "device": "cpu",
+                "include_first_order_private": True,
+                "output": str(tmp_path / "ruleset-mismatch-evaluation.json"),
             }
         )
 
