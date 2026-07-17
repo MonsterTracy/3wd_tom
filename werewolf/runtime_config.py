@@ -1,6 +1,7 @@
 """Strict validation for the sole supported collection runtime schema."""
 
 from copy import deepcopy
+from pathlib import Path
 
 
 RUNTIME_SCHEMA_VERSION = "runtime.v1"
@@ -138,6 +139,37 @@ def resolve_guess_config(config, profile):
     if guess["backend"] is None:
         return {"backend": profile["backend"], "model": profile["model"]}
     return deepcopy(guess)
+
+
+def resolve_collection_output(config, output_dir=None):
+    """Resolve the sole collection output layout without changing the schema."""
+
+    resolved = normalize_runtime_config(config)
+    if output_dir is None:
+        samples = Path(resolved["output"]["samples"])
+        return resolved, {
+            "output_dir": samples.parent.resolve(),
+            "samples": samples,
+            "failures": Path(resolved["output"]["failures"]),
+            "audit": samples.with_suffix(".audit.json"),
+            "logs": Path(resolved["output"]["logs"]),
+        }
+    if not isinstance(output_dir, (str, Path)) or not str(output_dir).strip():
+        raise ValueError("output-dir must be a non-empty path")
+    directory = Path(output_dir).expanduser().resolve()
+    resolved["output"] = {
+        "samples": str(directory / "samples.jsonl"),
+        "failures": str(directory / "failures.jsonl"),
+        "logs": str(directory / "logs"),
+        "overwrite": False,
+    }
+    return resolved, {
+        "output_dir": directory,
+        "samples": directory / "samples.jsonl",
+        "failures": directory / "failures.jsonl",
+        "audit": directory / "samples.audit.json",
+        "logs": directory / "logs",
+    }
 
 
 def build_prompt_runtime_metadata(config):

@@ -94,11 +94,16 @@ Load the key into the shell and run a one-game pilot with:
 set -a
 source .env
 set +a
-python -m script.tom.collect --config configs/tom/collect.yaml --games 1
+python -m script.tom.collect \
+  --config configs/tom/collect.yaml \
+  --games 1 \
+  --output-dir data/tom/pilot_YYYYMMDD_001
 ```
 
-The command refuses to append to existing outputs unless the canonical config's
-explicit `output.overwrite` setting allows replacement.
+Every pilot must use a new `--output-dir`; the collect command creates it and
+refuses any path that already exists. Generated JSON/JSONL under `data/tom/` is
+ignored by Git. If the audit fails, samples, failures, and audit output remain in
+that directory for diagnosis, so do not reuse an old pilot directory.
 
 ## Prompt Protocol V1
 

@@ -22,7 +22,8 @@ htmlcov/
 .codegraph/
 
 # Generated data, logs, checkpoints, and reports
-data/tom/*.jsonl
+data/tom/**/*.jsonl
+data/tom/**/*.json
 logs/
 artifacts/
 checkpoints/
@@ -40,5 +41,3 @@ temp/
 *.tmp
 *.bak
 *.swp
-data/tom/*.jsonl
-data/tom/*.json

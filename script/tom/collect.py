@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 
@@ -11,7 +12,11 @@ import yaml
 
 from werewolf.backends import load_named_backends
 from werewolf.runtime import build_collection_runtime, rollout, shuffled_roles
-from werewolf.runtime_config import resolve_guess_config, validate_runtime_config
+from werewolf.runtime_config import (
+    resolve_collection_output,
+    resolve_guess_config,
+    validate_runtime_config,
+)
 from werewolf.tom.collection import assert_audit_passes, build_audit_report
 
 
@@ -20,6 +25,45 @@ def _writable_ancestor(path):
     while not candidate.exists() and candidate != candidate.parent:
         candidate = candidate.parent
     return candidate
+
+
+def _validate_new_output_directory(path):
+    path = Path(path)
+    if path.exists():
+        if path.is_file():
+            raise NotADirectoryError(f"output-dir is a file: {path}")
+        raise FileExistsError(
+            f"output-dir already exists; choose a new directory: {path}"
+        )
+    ancestor = _writable_ancestor(path.parent)
+    if not os.access(ancestor, os.W_OK):
+        raise PermissionError(
+            f"output-dir parent is not writable via {ancestor}: {path.parent}"
+        )
+
+
+def _create_output_directory(path):
+    try:
+        Path(path).mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        raise OSError(f"failed to create output-dir {path}: {exc}") from exc
+
+
+def _write_audit_atomically(path, audit):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as output:
+        json.dump(audit, output, ensure_ascii=False, indent=2, sort_keys=True)
+        output.write("\n")
+        temporary_path = Path(output.name)
+    temporary_path.replace(path)
 
 
 def preflight_collection(config, *, env=None):
@@ -85,21 +129,28 @@ def _read_jsonl(path):
     return records
 
 
-def collect_from_config(config, *, games=None, backends=None, env=None):
+def collect_from_config(
+    config, *, games=None, output_dir=None, backends=None, env=None
+):
     config = deepcopy(config)
     if games is not None:
         if games < 1:
             raise ValueError("games must be positive")
         config["games"] = games
+    config, output_paths = resolve_collection_output(config, output_dir)
+    if output_dir is not None:
+        _validate_new_output_directory(output_paths["output_dir"])
     preflight = preflight_collection(config, env=env)
-    samples_path = Path(config["output"]["samples"])
-    audit_path = samples_path.with_suffix(".audit.json")
-    output_paths = [
+    if output_dir is not None:
+        _create_output_directory(output_paths["output_dir"])
+    samples_path = output_paths["samples"]
+    audit_path = output_paths["audit"]
+    output_files = [
         samples_path,
-        Path(config["output"]["failures"]),
+        output_paths["failures"],
         audit_path,
     ]
-    for path in output_paths:
+    for path in output_files:
         if path.exists() and not config["output"]["overwrite"]:
             raise FileExistsError(f"refusing to append to existing output: {path}")
         if path.exists():
@@ -138,15 +189,12 @@ def collect_from_config(config, *, games=None, backends=None, env=None):
         failures,
         game_ids=[result["game_id"] for result in results],
     )
-    audit_path.parent.mkdir(parents=True, exist_ok=True)
-    audit_path.write_text(
-        json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_audit_atomically(audit_path, audit)
     assert_audit_passes(audit)
     return {
         "games": results,
         "preflight": preflight,
+        "output_dir": str(output_paths["output_dir"]),
         "audit_path": str(audit_path),
         "audit": audit,
     }
@@ -156,15 +204,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/tom/collect.yaml")
     parser.add_argument("--games", type=int)
+    parser.add_argument("--output-dir")
     args = parser.parse_args()
     with Path(args.config).open("r", encoding="utf-8") as source:
         config = yaml.safe_load(source)
-    result = collect_from_config(config, games=args.games)
+    result = collect_from_config(
+        config, games=args.games, output_dir=args.output_dir
+    )
     audit = result["audit"]
     print(
         json.dumps(
             {
                 "games": len(result["games"]),
+                "output_dir": result["output_dir"],
                 "audit_path": result["audit_path"],
                 "unique_belief_elicitations": audit["unique_belief_elicitations"],
                 "successful_guesses": audit["successful_guesses"],
