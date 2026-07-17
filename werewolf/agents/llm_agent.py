@@ -7,13 +7,11 @@ from pathlib import Path
 from werewolf.agents.base_agent import Agent
 from werewolf.backends.base import BackendError
 from werewolf.events.streams import render_stream
+from werewolf.prompt_protocol import GAMEPLAY_PROMPT_SPEC, prompt_reference
 from werewolf.tom.guess_provider import BeliefGuessProvider
 
 
-GAME_RULES = """This is a seven-player Werewolf game with exactly two Werewolves,
-one Seer, three Villagers, and exactly one Witch or Guard. Village wins when both
-wolves are eliminated. Wolves win when all ordinary villagers or all special
-village roles are eliminated. Use only events visible to you."""
+GAMEPLAY_SYSTEM_PROMPT = GAMEPLAY_PROMPT_SPEC["text"]
 
 
 class LLMAgent(Agent):
@@ -49,26 +47,31 @@ class LLMAgent(Agent):
         actions = observation["valid_actions"]
         speech_phase = "speech" in observation["phase"]
         output_instruction = (
-            'Return exactly {"speech":"your public utterance"} as JSON.'
+            '发言阶段只返回如下 JSON：{"speech":"你的公开发言"}。'
             if speech_phase
             else (
-                'Choose one zero-based index from valid_actions and return exactly '
-                '{"action_index":0} as JSON.'
+                "从 valid_actions 中选择一个从零开始的索引，且只返回如下 JSON："
+                '{"action_index":0}。'
             )
         )
         return "\n\n".join(
             part
             for part in (
-                GAME_RULES,
-                f"You are player {observation['player_id']} with role {observation['role']}.",
-                f"Current phase: {observation['phase']}",
+                f"你是玩家 {observation['player_id']}，当前身份是 {observation['role']}。",
+                f"当前阶段：{observation['phase']}",
                 self.strategy_hint(observation),
-                "Visible events:\n" + render_stream(observation["events"]),
+                "当前可见事件：\n" + render_stream(observation["events"]),
                 "valid_actions=" + json.dumps(actions, ensure_ascii=False),
                 output_instruction,
             )
             if part
         )
+
+    def build_messages(self, observation):
+        return [
+            {"role": "system", "content": GAMEPLAY_SYSTEM_PROMPT},
+            {"role": "user", "content": self.format_observation(observation)},
+        ]
 
     @staticmethod
     def _parse_response(text, observation):
@@ -107,17 +110,21 @@ class LLMAgent(Agent):
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def act(self, observation):
-        prompt = self.format_observation(observation)
         responses = []
         error = None
         action = None
-        messages = [{"role": "user", "content": prompt}]
+        attempts = 0
+        messages = self.build_messages(observation)
         for attempt in range(1, 3):
+            attempts = attempt
             if attempt == 2:
                 messages.extend(
                     [
                         {"role": "assistant", "content": responses[-1] if responses else ""},
-                        {"role": "user", "content": "Return only valid JSON in the required schema."},
+                        {
+                            "role": "user",
+                            "content": "只返回符合当前阶段要求的有效 JSON，不要输出其他内容。",
+                        },
                     ]
                 )
             try:
@@ -139,6 +146,10 @@ class LLMAgent(Agent):
                 "player_id": observation["player_id"],
                 "role": observation["role"],
                 "phase": observation["phase"],
+                "gameplay_prompt": prompt_reference(GAMEPLAY_PROMPT_SPEC),
+                "model": self.model_name,
+                "temperature": self.temperature,
+                "attempts": attempts,
                 "responses": responses,
                 "error": error,
                 "action": list(action),

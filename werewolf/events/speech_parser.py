@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 
 from werewolf.events.schema import make_event, normalize_content
+from werewolf.prompt_protocol import PARSER_PROMPT_SPEC
 
 
 SPEECH_FAMILIES = (
@@ -28,22 +29,7 @@ PARSED_EVENT_FIELDS = {
     "parser_confidence",
 }
 
-SYSTEM_PROMPT = """Extract only explicit, local meanings from one Werewolf utterance.
-Return exactly {\"events\":[...]} as JSON. Each event contains exactly:
-event_family, target, content, qualifier, ref_event_id, source_span,
-parser_confidence. target is player ids and source_span is an exact quote.
-Allowed family/kind/value rules are:
-- BELIEF_ASSERTION/ROLE: Werewolf, Seer, Witch, Guard, or Villager.
-- BELIEF_ASSERTION/CAMP: Werewolf or Village.
-- BELIEF_ASSERTION/FACT: null.
-- SOCIAL_STANCE/STANCE: null; put polarity and strength in qualifier.
-- ACTION_POSITION/ACTION: VOTE or PASS; put commitment in qualifier.
-- CLAIM_RESPONSE/RELATION: null; put support, challenge, question, or retract
-  in qualifier.relation.
-qualifier may contain only polarity, certainty, stance, strength, commitment,
-evidence_source, relation. Never copy free text into content.value. If a claim
-cannot be represented exactly by these values, omit it. Use [] when nothing
-explicit is extractable. Never infer hidden intent or higher-order diagnoses."""
+SYSTEM_PROMPT = PARSER_PROMPT_SPEC["text"]
 
 
 @dataclass(frozen=True)
@@ -65,6 +51,7 @@ def _parse_payload(
     phase,
     turn,
     speaker,
+    parser_metadata,
 ):
     try:
         payload = json.loads(text)
@@ -108,6 +95,7 @@ def _parse_payload(
                 event_family=item["event_family"],
                 target=item["target"],
                 content=content,
+                metadata={"parser_protocol": parser_metadata},
                 qualifier=item["qualifier"],
                 ref_event_id=item["ref_event_id"],
                 source_span=source_span,
@@ -122,6 +110,7 @@ class SpeechEventParser:
         self.backend = backend
         self.model = model
         self.max_tokens = max_tokens
+        self.temperature = 0.0
 
     def parse(self, *, utterance, utterance_id, day, phase, turn, speaker):
         raw_text = []
@@ -143,7 +132,7 @@ class SpeechEventParser:
                         },
                         {
                             "role": "user",
-                            "content": "Repair the schema violation. Return only valid JSON.",
+                            "content": "你的上一条回复不符合 schema。只返回修正后的有效 JSON。",
                         },
                     ]
                 )
@@ -151,7 +140,7 @@ class SpeechEventParser:
                 response = self.backend.chat(
                     messages,
                     model=self.model,
-                    temperature=0.0,
+                    temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     response_format={"type": "json_object"},
                 )
@@ -164,6 +153,14 @@ class SpeechEventParser:
                     phase=phase,
                     turn=turn,
                     speaker=speaker,
+                    parser_metadata={
+                        "version": PARSER_PROMPT_SPEC["version"],
+                        "sha256": PARSER_PROMPT_SPEC["sha256"],
+                        "model": self.model,
+                        "temperature": self.temperature,
+                        "attempts": attempt,
+                        "status": "ok",
+                    },
                 )
                 return SpeechParseResult(
                     status="ok",

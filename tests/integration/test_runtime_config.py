@@ -8,6 +8,12 @@ import pytest
 import yaml
 
 from script.tom.collect import collect_from_config, preflight_collection
+from werewolf.prompt_protocol import (
+    BELIEF_PROMPT_SPEC,
+    GAMEPLAY_PROMPT_SPEC,
+    PARSER_PROMPT_SPEC,
+    protocol_id_from_references,
+)
 from werewolf.runtime_config import validate_runtime_config
 
 
@@ -82,9 +88,14 @@ def test_collection_preflight_resolves_guess_inheritance_and_override_without_ne
 class DeterministicFakeBackend:
     def chat(self, messages, **kwargs):
         system = messages[0]["content"] if messages[0]["role"] == "system" else ""
-        if system.startswith("Extract only explicit"):
-            return '{"events":[]}'
-        if system.startswith("You report the player's current belief"):
+        if system == PARSER_PROMPT_SPEC["text"]:
+            return (
+                '{"events":[{"event_family":"BELIEF_ASSERTION","target":[],'
+                '"content":{"kind":"FACT","value":null},"qualifier":{},'
+                '"ref_event_id":null,"source_span":"确定性发言",'
+                '"parser_confidence":1.0}]}'
+            )
+        if system == BELIEF_PROMPT_SPEC["text"]:
             view = messages[1]["content"]
             self_role = next(
                 line for line in view.splitlines() if "kind=SELF_ROLE" in line
@@ -106,9 +117,10 @@ class DeterministicFakeBackend:
                 if known_wolves.issubset(pair) and known_good.isdisjoint(pair)
             )
             return json.dumps({"wolf_pair": pair})
-        prompt = messages[0]["content"]
-        if 'Return exactly {"speech"' in prompt:
-            return '{"speech":"deterministic statement"}'
+        assert system == GAMEPLAY_PROMPT_SPEC["text"]
+        prompt = messages[1]["content"]
+        if '{"speech":"你的公开发言"}' in prompt:
+            return '{"speech":"确定性发言"}'
         return '{"action_index":1}'
 
 
@@ -146,7 +158,64 @@ def test_one_fake_game_collects_samples_failures_and_audit_without_network(tmp_p
     assert audit["unknown_token_ratio"] == 0.0
     assert audit["not_applicable_value_count"] > 0
     assert audit["top_unknown_raw_values"] == []
-    assert Path(config["output"]["samples"]).read_text(encoding="utf-8").strip()
+    samples = [
+        json.loads(line)
+        for line in Path(config["output"]["samples"]).read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    assert samples
+    protocol_ids = {sample["prompt_protocol"]["protocol_id"] for sample in samples}
+    assert len(protocol_ids) == 1
+    protocol = samples[0]["prompt_protocol"]
+    assert protocol["language"] == "zh-CN"
+    references = {
+        name: protocol[name] for name in ("gameplay", "belief", "parser")
+    }
+    assert protocol["protocol_id"] == protocol_id_from_references(references)
+    assert audit["prompt_protocol_ids"] == [protocol["protocol_id"]]
+    assert audit["prompt_protocol_distribution"] == {
+        protocol["protocol_id"]: len(samples)
+    }
+    assert audit["missing_prompt_protocol_count"] == 0
+    assert audit["invalid_prompt_protocol_count"] == 0
+    parser_events = [
+        event
+        for sample in samples
+        for event in sample["events"]
+        if event["source_type"] == "speech_parser"
+    ]
+    assert parser_events
+    assert all(
+        event["metadata"]["parser_protocol"]["version"] == "parser.zh.v1"
+        and event["metadata"]["parser_protocol"]["sha256"]
+        == PARSER_PROMPT_SPEC["sha256"]
+        and event["metadata"]["parser_protocol"]["model"] == "deepseek-chat"
+        and event["metadata"]["parser_protocol"]["temperature"] == 0.0
+        and event["metadata"]["parser_protocol"]["status"] == "ok"
+        for event in parser_events
+    )
+    log_records = [
+        json.loads(line)
+        for path in sorted((tmp_path / "logs" / "game_000019").glob("*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert log_records
+    assert all(
+        record["gameplay_prompt"] == {
+            "version": "gameplay.zh.v1",
+            "sha256": GAMEPLAY_PROMPT_SPEC["sha256"],
+        }
+        and record["model"] == "deepseek-chat"
+        and record["temperature"] == 0.7
+        and record["attempts"] in (1, 2)
+        and "action" in record
+        for record in log_records
+    )
+    assert "DEEPSEEK_API_KEY" not in json.dumps(samples)
+    assert "fake-for-test" not in json.dumps(samples)
     assert Path(config["output"]["failures"]).exists()
     assert Path(config["output"]["failures"]).read_text(encoding="utf-8") == ""
     assert json.loads(Path(result["audit_path"]).read_text(encoding="utf-8")) == audit

@@ -7,7 +7,12 @@ from werewolf.agents import agent_registry
 from werewolf.backends import load_named_backends, resolve_backend
 from werewolf.envs.werewolf_text_env_v0 import WerewolfTextEnvV0
 from werewolf.events.speech_parser import SpeechEventParser
-from werewolf.runtime_config import resolve_guess_config, validate_runtime_config
+from werewolf.prompt_protocol import build_prompt_protocol
+from werewolf.runtime_config import (
+    build_prompt_runtime_metadata,
+    resolve_guess_config,
+    validate_runtime_config,
+)
 from werewolf.tom.collection import JsonlSink, ToMCollector
 from werewolf.tom.guess_provider import BeliefGuessProvider
 
@@ -79,6 +84,7 @@ def build_collection_runtime(config, *, game_id, roles, backends=None):
         game_id=game_id,
         roles=roles,
         guess_provider_for=guess_provider_for,
+        prompt_protocol=build_prompt_protocol(build_prompt_runtime_metadata(config)),
         sample_sink=JsonlSink(config["output"]["samples"]),
         failure_sink=JsonlSink(config["output"]["failures"]),
     )

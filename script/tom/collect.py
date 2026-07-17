@@ -1,4 +1,4 @@
-"""Collect ``tom.v1`` samples from complete games."""
+"""Collect ``tom.v1_1`` samples from complete games."""
 
 import argparse
 import json

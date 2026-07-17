@@ -3,6 +3,7 @@
 import json
 import math
 from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from werewolf.tom.schemas import (
     first_order_key,
     make_sample,
     second_order_key,
+    validate_prompt_protocol,
     validate_sample,
 )
 
@@ -114,11 +116,61 @@ def build_audit_report(
     first_by_id = {}
     first_records = []
     second_records = []
+    prompt_protocol_distribution = Counter()
+    gameplay_prompt_versions = set()
+    belief_prompt_versions = set()
+    parser_prompt_versions = set()
+    gameplay_prompt_hashes = set()
+    belief_prompt_hashes = set()
+    parser_prompt_hashes = set()
+    runtime_model_distribution = Counter()
+    missing_prompt_protocol_count = 0
+    invalid_prompt_protocol_count = 0
 
     for record in records:
         if not isinstance(record, dict):
             schema_errors += 1
+            missing_prompt_protocol_count += 1
             continue
+        prompt_protocol = record.get("prompt_protocol")
+        if prompt_protocol is None:
+            missing_prompt_protocol_count += 1
+        else:
+            protocol_id = prompt_protocol.get("protocol_id") if isinstance(
+                prompt_protocol, dict
+            ) else None
+            if isinstance(protocol_id, str):
+                prompt_protocol_distribution[protocol_id] += 1
+            if isinstance(prompt_protocol, dict):
+                for name, versions, hashes in (
+                    ("gameplay", gameplay_prompt_versions, gameplay_prompt_hashes),
+                    ("belief", belief_prompt_versions, belief_prompt_hashes),
+                    ("parser", parser_prompt_versions, parser_prompt_hashes),
+                ):
+                    reference = prompt_protocol.get(name)
+                    if isinstance(reference, dict):
+                        if isinstance(reference.get("version"), str):
+                            versions.add(reference["version"])
+                        if isinstance(reference.get("sha256"), str):
+                            hashes.add(reference["sha256"])
+            try:
+                validate_prompt_protocol(prompt_protocol)
+            except (KeyError, TypeError, ValueError):
+                invalid_prompt_protocol_count += 1
+            else:
+                runtime = prompt_protocol["runtime"]
+                for component in ("gameplay", "belief"):
+                    profiles = runtime[f"{component}_profiles"]
+                    for profile_name, profile in profiles.items():
+                        runtime_model_distribution[
+                            f"{component}:{profile_name}:{profile['backend']}:"
+                            f"{profile['model']}:temperature={profile['temperature']}"
+                        ] += 1
+                parser_runtime = runtime["parser"]
+                runtime_model_distribution[
+                    f"parser:{parser_runtime['backend']}:{parser_runtime['model']}:"
+                    f"temperature={parser_runtime['temperature']}"
+                ] += 1
         if record.get("game_id") is not None:
             games.add(str(record["game_id"]))
         sample_id = record.get("sample_id")
@@ -284,7 +336,7 @@ def build_audit_report(
         "max": max(sequence_lengths, default=0),
     }
     return {
-        "schema_version": "tom.audit.v1_1",
+        "schema_version": "tom.audit.v1_2",
         "games": len(games),
         "public_checkpoints": len(public_checkpoints),
         "private_checkpoints": len(private_checkpoints),
@@ -337,6 +389,17 @@ def build_audit_report(
         "samples_by_day": _distribution(samples_by_day),
         "samples_by_phase": _distribution(samples_by_phase),
         "first_order_by_observer_role": _distribution(first_by_role),
+        "prompt_protocol_ids": sorted(prompt_protocol_distribution),
+        "prompt_protocol_distribution": _distribution(prompt_protocol_distribution),
+        "gameplay_prompt_versions": sorted(gameplay_prompt_versions),
+        "belief_prompt_versions": sorted(belief_prompt_versions),
+        "parser_prompt_versions": sorted(parser_prompt_versions),
+        "gameplay_prompt_hashes": sorted(gameplay_prompt_hashes),
+        "belief_prompt_hashes": sorted(belief_prompt_hashes),
+        "parser_prompt_hashes": sorted(parser_prompt_hashes),
+        "runtime_model_distribution": _distribution(runtime_model_distribution),
+        "missing_prompt_protocol_count": missing_prompt_protocol_count,
+        "invalid_prompt_protocol_count": invalid_prompt_protocol_count,
     }
 
 
@@ -351,8 +414,19 @@ def assert_audit_passes(report):
         "labels_outside_mask",
         "unknown_kind_count",
         "unknown_value_count",
+        "missing_prompt_protocol_count",
+        "invalid_prompt_protocol_count",
     )
     failures = {name: report.get(name, 0) for name in fatal_fields if report.get(name, 0)}
+    for field in (
+        "prompt_protocol_ids",
+        "gameplay_prompt_hashes",
+        "belief_prompt_hashes",
+        "parser_prompt_hashes",
+    ):
+        values = report.get(field, [])
+        if len(values) != 1:
+            failures[field] = values
     if failures:
         raise RuntimeError(f"collection audit failed: {failures}")
     return True
@@ -379,6 +453,7 @@ class ToMCollector:
         game_id,
         roles,
         guess_provider_for,
+        prompt_protocol,
         sample_sink=None,
         failure_sink=None,
     ):
@@ -387,6 +462,8 @@ class ToMCollector:
         self.game_id = str(game_id)
         self.roles = tuple(roles)
         self.guess_provider_for = guess_provider_for
+        validate_prompt_protocol(prompt_protocol)
+        self.prompt_protocol = deepcopy(prompt_protocol)
         self.sample_sink = sample_sink
         self.failure_sink = failure_sink
         self._sample_ids = set()
@@ -447,6 +524,7 @@ class ToMCollector:
         sample = make_sample(
             sample_id=f"{base['state_id']}:{suffix}",
             guess=guess,
+            prompt_protocol=self.prompt_protocol,
             **base,
             **kwargs,
         )

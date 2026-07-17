@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
+from werewolf.prompt_protocol import checkpoint_prompt_metadata
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import collate_features
 from werewolf.tom.losses import masked_pair_cross_entropy
@@ -122,6 +123,9 @@ def train_from_config(config):
     }
     train_dataset = ToMDataset(data["train_paths"], **dataset_kwargs)
     valid_dataset = ToMDataset(data["valid_paths"], **dataset_kwargs)
+    prompt_protocol_metadata = checkpoint_prompt_metadata(
+        [train_dataset.prompt_protocol, valid_dataset.prompt_protocol]
+    )
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
         train_dataset,
@@ -175,6 +179,7 @@ def train_from_config(config):
                 "kind_vocabulary": dict(KIND2ID),
                 "value_vocabulary": dict(VALUE2ID),
             },
+            "prompt_protocol": prompt_protocol_metadata,
             "epoch": epoch,
             "config": config,
             "model_state": model.state_dict(),

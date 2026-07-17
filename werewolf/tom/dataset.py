@@ -1,5 +1,6 @@
-"""Dataset loader that accepts only successful ``tom.v1`` JSONL records."""
+"""Dataset loader for successful single-protocol ``tom.v1_1`` records."""
 
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -38,6 +39,15 @@ class ToMDataset(Dataset):
             validate_sample_collection(records)
         except ValueError as exc:
             raise ValueError(f"dataset identity/alignment error: {exc}") from exc
+        protocol_ids = sorted(
+            {record["prompt_protocol"]["protocol_id"] for record in records}
+        )
+        if len(protocol_ids) != 1:
+            raise ValueError(
+                f"dataset must contain one prompt protocol; found={protocol_ids}"
+            )
+        self.protocol_id = protocol_ids[0]
+        self.prompt_protocol = deepcopy(records[0]["prompt_protocol"])
         self.records = [
             record
             for record in records
@@ -45,7 +55,7 @@ class ToMDataset(Dataset):
             and (mode is None or record["mode"] == mode)
         ]
         if not self.records:
-            raise ValueError("dataset contains no matching successful tom.v1 samples")
+            raise ValueError("dataset contains no matching successful tom.v1_1 samples")
 
     def __len__(self):
         return len(self.records)

@@ -28,6 +28,7 @@ from werewolf.events.environment_events import (
 )
 from werewolf.events.schema import make_event, validate_event
 from werewolf.events.streams import public_events, visible_events
+from werewolf.prompt_protocol import PARSER_PROMPT_SPEC
 
 
 def test_environment_events_have_fixed_schema_and_visibility():
@@ -108,6 +109,16 @@ def _parsed_event(*, event_family, kind, value, qualifier=None):
         event_family=event_family,
         target=2,
         content={"kind": kind, "value": value},
+        metadata={
+            "parser_protocol": {
+                "version": PARSER_PROMPT_SPEC["version"],
+                "sha256": PARSER_PROMPT_SPEC["sha256"],
+                "model": "test-parser",
+                "temperature": 0.0,
+                "attempts": 1,
+                "status": "ok",
+            }
+        },
         qualifier=qualifier,
         source_span="player 2",
         parser_confidence=1.0,

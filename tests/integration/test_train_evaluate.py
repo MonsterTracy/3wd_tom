@@ -3,8 +3,13 @@ from copy import deepcopy
 from pathlib import Path
 
 import torch
+import pytest
 
 from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
+from werewolf.prompt_protocol import (
+    checkpoint_prompt_metadata,
+    protocol_id_from_references,
+)
 from werewolf.tom.evaluation import evaluate_from_config
 from werewolf.tom.pair_space import WOLF_PAIRS
 from werewolf.tom.training import train_from_config
@@ -65,6 +70,22 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
         "kind_vocabulary": KIND2ID,
         "value_vocabulary": VALUE2ID,
     }
+    assert checkpoint["prompt_protocol"] == checkpoint_prompt_metadata(
+        [first_order["prompt_protocol"]]
+    )
+    assert checkpoint["prompt_protocol"]["prompt_language"] == "zh-CN"
+    assert checkpoint["prompt_protocol"]["prompt_protocol_version"] == (
+        "prompt_protocol.zh.v1"
+    )
+    assert checkpoint["prompt_protocol"]["gameplay_prompt_version"] == (
+        "gameplay.zh.v1"
+    )
+    assert checkpoint["prompt_protocol"]["belief_prompt_version"] == (
+        "belief.zh.v1"
+    )
+    assert checkpoint["prompt_protocol"]["parser_prompt_version"] == (
+        "parser.zh.v1"
+    )
     evaluation_path = tmp_path / "evaluation.json"
     evaluation = evaluate_from_config(
         {
@@ -79,3 +100,27 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     )
     assert set(evaluation["by_task"]) == {"first_order"}
     assert json.loads(evaluation_path.read_text(encoding="utf-8"))["overall"]
+
+    mismatched = deepcopy(first_order)
+    mismatched["prompt_protocol"]["parser"]["sha256"] = "0" * 64
+    references = {
+        name: mismatched["prompt_protocol"][name]
+        for name in ("gameplay", "belief", "parser")
+    }
+    mismatched["prompt_protocol"]["protocol_id"] = protocol_id_from_references(
+        references
+    )
+    mismatched_path = tmp_path / "mismatched.jsonl"
+    mismatched_path.write_text(json.dumps(mismatched) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="prompt protocol"):
+        evaluate_from_config(
+            {
+                "schema_version": "evaluate.v1",
+                "checkpoint": str(output_dir / "best.pt"),
+                "data_paths": [str(mismatched_path)],
+                "batch_size": 2,
+                "device": "cpu",
+                "include_first_order_private": True,
+                "output": str(tmp_path / "mismatch-evaluation.json"),
+            }
+        )

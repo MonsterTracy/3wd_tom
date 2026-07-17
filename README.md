@@ -77,12 +77,59 @@ pip install -e '.[dev]'
 For API collection, create an untracked `.env`:
 
 ```dotenv
-OPENAI_API_KEY=replace-me
+DEEPSEEK_API_KEY=replace-me
 ```
 
-Select the OpenAI-compatible base URL, model, parser, and role-group agent
-profiles explicitly in `configs/tom/collect.yaml`. Legacy runtime YAML is
+The canonical collection config uses DeepSeek's OpenAI-compatible endpoint and
+`deepseek-chat` for gameplay, belief elicitation, and speech parsing. The YAML
+contains only runtime choices such as backend, model, and gameplay temperature;
+canonical prompt text cannot be overridden from YAML. Legacy runtime YAML is
 rejected rather than normalized.
+
+Load the key into the shell and run a one-game pilot with:
+
+```bash
+set -a
+source .env
+set +a
+python -m script.tom.collect --config configs/tom/collect.yaml --games 1
+```
+
+The command refuses to append to existing outputs unless the canonical config's
+explicit `output.overwrite` setting allows replacement.
+
+## Prompt Protocol V1
+
+`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V1. Its formal
+instruction language is Chinese (`language: zh-CN`) and it has three canonical
+templates:
+
+- `gameplay.zh.v1` gives the agent stable rules, legal-information boundaries,
+  evidence-quality guidance, and prompt-injection isolation. The current player
+  view, legal actions, strategy hint, and output schema remain in a dynamic user
+  message.
+- `belief.zh.v1` measures one player's private joint MAP belief over the complete
+  two-Werewolf pair. It does not continue gameplay or request reasoning.
+- `parser.zh.v1` extracts only explicit local speech semantics into the existing
+  controlled event vocabulary. Utterances are treated as untrusted game data.
+
+Natural-language instructions are Chinese, while machine-readable JSON keys
+(`speech`, `action_index`, `wolf_pair`), role/camp values, event families,
+`content.kind`/`content.value`, and qualifier enums remain in English.
+
+Each template is normalized to LF line endings and hashed with SHA-256. The
+stable hashes and derived `protocol_id` describe static prompt templates only;
+they exclude dynamic player views, event history, hidden roles, wolf teams, and
+credentials. Prompt versions and hashes are written to `tom.v1_1` samples,
+collection audits, parser event metadata, gameplay logs, and model checkpoints.
+Changing canonical Chinese prompt text requires incrementing its version and
+recollecting the affected data. Chinese- and English-protocol records must not
+be mixed without explicit protocol metadata; the strict loader rejects the old
+English protocol rather than adapting it.
+
+Prompt metadata is a data-generation condition, not a model feature. A trained
+model therefore represents the behavior distribution induced by its recorded
+Prompt-Agent protocol; evaluation rejects data from a different protocol.
 
 ## Commands
 
@@ -99,11 +146,13 @@ cross-entropy objective.
 
 ## Data contract
 
-Only successful `tom.v1` JSONL records are trainable. Each record names its
+Only successful `tom.v1_1` JSONL records are trainable. Each record names its
 task/mode/checkpoint, carries the exact input events and 21-way output mask, and
-stores the elicited pair/index plus raw elicitation metadata. Failed records are
+stores the elicited pair/index plus raw elicitation metadata and one required
+`prompt_protocol` object. Failed records carry the same protocol object and are
 kept separately with raw responses and errors. The loader deliberately rejects
-older schemas; ground-truth role vectors cannot be converted into subjective guesses.
+older schemas and mixed-protocol files; ground-truth role vectors cannot be
+converted into subjective guesses.
 
 A two-record synthetic fixture is available at
 `tests/fixtures/tom_v1.jsonl` for schema and smoke tests.

@@ -3,13 +3,11 @@
 import json
 from dataclasses import dataclass
 
+from werewolf.prompt_protocol import BELIEF_PROMPT_SPEC
 from werewolf.tom.pair_space import normalize_pair, pair_index, validate_pair_mask
 
 
-SYSTEM_PROMPT = """You report the player's current belief in a seven-player Werewolf game.
-Use only the supplied view. Do not continue the game, choose an action, or explain.
-Return exactly one JSON object with this form: {\"wolf_pair\":[1,2]}.
-The two player ids must be distinct integers from 1 through 7."""
+SYSTEM_PROMPT = BELIEF_PROMPT_SPEC["text"]
 
 
 @dataclass(frozen=True)
@@ -63,8 +61,8 @@ class BeliefGuessProvider:
                     {
                         "role": "user",
                         "content": (
-                            "Your response was invalid. Return only the required JSON "
-                            "object with a valid pair."
+                            "你的上一条回复格式无效。只返回符合要求的 JSON 对象，"
+                            "并给出一个合法的双狼人组合。"
                         ),
                     }
                 )

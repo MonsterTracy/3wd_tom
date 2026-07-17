@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 
+from werewolf.prompt_protocol import PARSER_PROMPT_SPEC
+
 
 EVENT_SCHEMA_VERSION = "events.v1"
 
@@ -133,6 +135,14 @@ REQUIRED_EVENT_FIELDS = (
     "source_span",
     "parser_confidence",
 )
+PARSER_PROTOCOL_FIELDS = {
+    "version",
+    "sha256",
+    "model",
+    "temperature",
+    "attempts",
+    "status",
+}
 
 
 def _player_id(value, *, allow_zero=False):
@@ -336,6 +346,27 @@ def validate_event(event: dict) -> bool:
             raise ValueError("speech-derived events require utterance_id and source_span")
         if confidence is None:
             raise ValueError("speech-derived events require parser_confidence")
+        if set(event["metadata"]) != {"parser_protocol"}:
+            raise ValueError("speech-derived event metadata requires parser_protocol")
+        parser_protocol = event["metadata"]["parser_protocol"]
+        if not isinstance(parser_protocol, dict) or set(parser_protocol) != PARSER_PROTOCOL_FIELDS:
+            raise ValueError("parser_protocol fields do not match the schema")
+        if parser_protocol["version"] != PARSER_PROMPT_SPEC["version"]:
+            raise ValueError("parser_protocol version is incompatible")
+        if parser_protocol["sha256"] != PARSER_PROMPT_SPEC["sha256"]:
+            raise ValueError("parser_protocol sha256 is incompatible")
+        if not isinstance(parser_protocol["model"], str) or not parser_protocol["model"]:
+            raise ValueError("parser_protocol model is required")
+        if (
+            isinstance(parser_protocol["temperature"], bool)
+            or not isinstance(parser_protocol["temperature"], (int, float))
+            or parser_protocol["temperature"] != 0.0
+        ):
+            raise ValueError("parser_protocol temperature must be 0.0")
+        if type(parser_protocol["attempts"]) is not int or not 1 <= parser_protocol["attempts"] <= 2:
+            raise ValueError("parser_protocol attempts must be one or two")
+        if parser_protocol["status"] != "ok":
+            raise ValueError("parser_protocol status must be ok for emitted events")
     else:
         if event["event_family"] not in EVENT_FAMILIES[4:]:
             raise ValueError("environment may emit only GAME_EVENT or PRIVATE_FACT")

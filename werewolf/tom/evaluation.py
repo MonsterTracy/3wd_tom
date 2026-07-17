@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from werewolf.events.encoder import ENCODER_SCHEMA_VERSION, KIND2ID, VALUE2ID
+from werewolf.prompt_protocol import checkpoint_prompt_metadata
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import MODE_IDS, TASK_IDS, collate_features
 from werewolf.tom.metrics import compute_metrics
@@ -58,13 +59,18 @@ def evaluate_from_config(config):
     }
     if checkpoint.get("event_encoder") != expected_encoder:
         raise ValueError("checkpoint event encoder metadata is incompatible")
-    model = ToMModel(ToMModelConfig(**checkpoint["config"]["model"]))
-    model.load_state_dict(checkpoint["model_state"])
-    model.to(device).eval()
     dataset = ToMDataset(
         config["data_paths"],
         include_first_order_private=config["include_first_order_private"],
     )
+    expected_prompt_protocol = checkpoint_prompt_metadata(
+        [dataset.prompt_protocol]
+    )
+    if checkpoint.get("prompt_protocol") != expected_prompt_protocol:
+        raise ValueError("checkpoint prompt protocol does not match evaluation data")
+    model = ToMModel(ToMModelConfig(**checkpoint["config"]["model"]))
+    model.load_state_dict(checkpoint["model_state"])
+    model.to(device).eval()
     loader = DataLoader(
         dataset,
         batch_size=config["batch_size"],

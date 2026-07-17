@@ -86,7 +86,9 @@ def validate_runtime_config(config):
         if profile["backend"] not in backends:
             raise ValueError(f"agent profile {name} backend does not exist")
         _text(profile["model"], f"agent profile {name}.model")
-        if not isinstance(profile["temperature"], (int, float)):
+        if isinstance(profile["temperature"], bool) or not isinstance(
+            profile["temperature"], (int, float)
+        ):
             raise ValueError(f"agent profile {name}.temperature must be numeric")
         if not isinstance(profile["strategy"], dict):
             raise ValueError(f"agent profile {name}.strategy must be a mapping")
@@ -136,3 +138,40 @@ def resolve_guess_config(config, profile):
     if guess["backend"] is None:
         return {"backend": profile["backend"], "model": profile["model"]}
     return deepcopy(guess)
+
+
+def build_prompt_runtime_metadata(config):
+    """Describe the configured models separately from stable prompt hashes."""
+
+    validate_runtime_config(config)
+    profiles = config["agents"]["profiles"]
+    assigned_profiles = sorted(
+        {
+            config["agents"]["werewolf_profile"],
+            config["agents"]["village_profile"],
+        }
+    )
+    gameplay_profiles = {}
+    belief_profiles = {}
+    for profile_name in assigned_profiles:
+        profile = profiles[profile_name]
+        guess = resolve_guess_config(config, profile)
+        gameplay_profiles[profile_name] = {
+            "backend": profile["backend"],
+            "model": profile["model"],
+            "temperature": profile["temperature"],
+        }
+        belief_profiles[profile_name] = {
+            "backend": guess["backend"],
+            "model": guess["model"],
+            "temperature": 0.0,
+        }
+    return {
+        "gameplay_profiles": gameplay_profiles,
+        "belief_profiles": belief_profiles,
+        "parser": {
+            "backend": config["parser"]["backend"],
+            "model": config["parser"]["model"],
+            "temperature": 0.0,
+        },
+    }

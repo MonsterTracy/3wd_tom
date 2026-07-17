@@ -1,6 +1,7 @@
 """Visibility-safe public and per-player private event streams."""
 
 from copy import deepcopy
+import json
 
 from werewolf.events.schema import event_sort_key, validate_event
 
@@ -42,11 +43,16 @@ def validate_stream(events):
 def render_event(event: dict) -> str:
     content = event["content"]
     targets = ",".join(str(value) for value in event["target"]) or "none"
-    return (
+    rendered = (
         f"day={event['day']} phase={event['phase']} speaker={event['speaker']} "
         f"family={event['event_family']} target={targets} "
         f"kind={content['kind']} value={content['value']}"
     )
+    if event["source_span"] is not None:
+        rendered += " source_span=" + json.dumps(
+            event["source_span"], ensure_ascii=False
+        )
+    return rendered
 
 
 def render_stream(events) -> str:

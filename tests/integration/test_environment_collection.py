@@ -17,7 +17,9 @@ from werewolf.events.environment_events import (
 )
 from werewolf.events.speech_parser import SpeechEventParser
 from werewolf.events.streams import visible_events
+from werewolf.prompt_protocol import build_prompt_protocol, protocol_id_from_references
 from werewolf.tom.collection import (
+    JsonlSink,
     ToMCollector,
     assert_audit_passes,
     build_audit_report,
@@ -32,6 +34,17 @@ from werewolf.tom.schemas import validate_sample_collection
 
 ROLES = ["Werewolf", "Werewolf", "Seer", "Witch", "Villager", "Villager", "Villager"]
 FIXTURE = Path("tests/fixtures/tom_v1.jsonl")
+TEST_PROMPT_PROTOCOL = build_prompt_protocol(
+    {
+        "gameplay_profiles": {
+            "fake": {"backend": "fake", "model": "fake", "temperature": 0.7}
+        },
+        "belief_profiles": {
+            "fake": {"backend": "fake", "model": "fake", "temperature": 0.0}
+        },
+        "parser": {"backend": "fake", "model": "fake-parser", "temperature": 0.0},
+    }
+)
 
 
 class EmptyParserBackend:
@@ -65,7 +78,8 @@ def _rollout(environment):
 def test_full_game_uses_unified_events_and_checkpoint_collection():
     collector = ToMCollector(
         game_id="integration", roles=ROLES,
-        guess_provider_for=lambda player_id: ValidGuessProvider()
+        guess_provider_for=lambda player_id: ValidGuessProvider(),
+        prompt_protocol=TEST_PROMPT_PROTOCOL,
     )
     environment = WerewolfTextEnvV0(
         random_seed=11,
@@ -125,7 +139,7 @@ def test_full_game_uses_unified_events_and_checkpoint_collection():
     assert torch.isfinite(loss)
 
 
-def test_guess_failure_does_not_stop_the_game_or_enter_samples():
+def test_guess_failure_does_not_stop_the_game_or_enter_samples(tmp_path):
     class FailureProvider:
         def elicit(self, **kwargs):
             return GuessResult(
@@ -135,12 +149,30 @@ def test_guess_failure_does_not_stop_the_game_or_enter_samples():
 
     collector = ToMCollector(
         game_id="failures", roles=ROLES,
-        guess_provider_for=lambda player_id: FailureProvider()
+        guess_provider_for=lambda player_id: FailureProvider(),
+        prompt_protocol=TEST_PROMPT_PROTOCOL,
+        failure_sink=JsonlSink(tmp_path / "failures.jsonl"),
     )
     environment = WerewolfTextEnvV0(random_seed=4, tom_collector=collector)
     _rollout(environment)
     assert any(batch.failures for batch in environment.collection_batches)
     assert not any(batch.samples for batch in environment.collection_batches)
+    assert all(
+        sample["prompt_protocol"] == TEST_PROMPT_PROTOCOL
+        for batch in environment.collection_batches
+        for sample in batch.failures
+    )
+    failure_records = [
+        json.loads(line)
+        for line in (tmp_path / "failures.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert failure_records
+    assert all(
+        record["prompt_protocol"] == TEST_PROMPT_PROTOCOL
+        for record in failure_records
+    )
 
 
 def _event(builder, event_id, turn, **kwargs):
@@ -181,6 +213,7 @@ def test_public_checkpoint_reuses_one_first_order_guess_with_explicit_source():
         game_id="source",
         roles=ROLES,
         guess_provider_for=lambda player_id: ValidGuessProvider(),
+        prompt_protocol=TEST_PROMPT_PROTOCOL,
     )
     batch = collector.collect(
         trigger_event=events[-1], events=events, alive_players=[3]
@@ -220,6 +253,7 @@ def test_private_checkpoint_never_creates_second_order_sample():
         game_id="private",
         roles=ROLES,
         guess_provider_for=lambda player_id: ValidGuessProvider(),
+        prompt_protocol=TEST_PROMPT_PROTOCOL,
     )
     batch = collector.collect(
         trigger_event=events[-1], events=events, alive_players=[3]
@@ -249,6 +283,12 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         "top_unknown_raw_values",
         "sequence_length", "truncated_samples", "samples_by_day", "samples_by_phase",
         "first_order_by_observer_role",
+        "prompt_protocol_ids", "prompt_protocol_distribution",
+        "gameplay_prompt_versions", "belief_prompt_versions",
+        "parser_prompt_versions", "gameplay_prompt_hashes",
+        "belief_prompt_hashes", "parser_prompt_hashes",
+        "runtime_model_distribution", "missing_prompt_protocol_count",
+        "invalid_prompt_protocol_count",
     }
     assert required <= set(report)
     assert report["games"] == 1
@@ -263,6 +303,17 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     assert report["unknown_token_ratio"] == 0.0
     assert report["not_applicable_value_count"] > 0
     assert report["top_unknown_raw_values"] == []
+    assert report["prompt_protocol_ids"] == [
+        records[0]["prompt_protocol"]["protocol_id"]
+    ]
+    assert report["prompt_protocol_distribution"] == {
+        records[0]["prompt_protocol"]["protocol_id"]: 2
+    }
+    assert report["gameplay_prompt_versions"] == ["gameplay.zh.v1"]
+    assert report["belief_prompt_versions"] == ["belief.zh.v1"]
+    assert report["parser_prompt_versions"] == ["parser.zh.v1"]
+    assert report["missing_prompt_protocol_count"] == 0
+    assert report["invalid_prompt_protocol_count"] == 0
     assert assert_audit_passes(report)
 
     duplicate_report = build_audit_report(records + [deepcopy(records[0])])
@@ -313,6 +364,28 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
     ]
     with pytest.raises(RuntimeError, match="unknown_value_count"):
         assert_audit_passes(unknown_value_report)
+
+    missing_protocol = deepcopy(records)
+    missing_protocol[0].pop("prompt_protocol")
+    missing_protocol_report = build_audit_report(missing_protocol)
+    assert missing_protocol_report["missing_prompt_protocol_count"] == 1
+    with pytest.raises(RuntimeError, match="missing_prompt_protocol_count"):
+        assert_audit_passes(missing_protocol_report)
+
+    mixed_protocol = deepcopy(records)
+    mixed_protocol[1]["prompt_protocol"]["belief"]["sha256"] = "0" * 64
+    references = {
+        name: mixed_protocol[1]["prompt_protocol"][name]
+        for name in ("gameplay", "belief", "parser")
+    }
+    mixed_protocol[1]["prompt_protocol"]["protocol_id"] = (
+        protocol_id_from_references(references)
+    )
+    mixed_protocol_report = build_audit_report(mixed_protocol)
+    assert len(mixed_protocol_report["prompt_protocol_ids"]) == 2
+    assert mixed_protocol_report["invalid_prompt_protocol_count"] == 0
+    with pytest.raises(RuntimeError, match="prompt_protocol_ids"):
+        assert_audit_passes(mixed_protocol_report)
 
 
 def test_failed_guess_is_audited_but_is_not_a_fatal_gate():

@@ -1,9 +1,16 @@
 """Strict, versioned JSON schemas for ToM collection samples."""
 
 from copy import deepcopy
+import re
 
 from werewolf.events.schema import validate_event
 from werewolf.events.streams import knowledge_for_player
+from werewolf.prompt_protocol import (
+    PROMPT_LANGUAGE,
+    PROMPT_NAMES,
+    PROMPT_PROTOCOL_VERSION,
+    protocol_id_from_references,
+)
 from werewolf.tom.masks import (
     SECOND_ORDER_MODES,
     first_order_knowledge_mask,
@@ -12,7 +19,7 @@ from werewolf.tom.masks import (
 from werewolf.tom.pair_space import NUM_WOLF_PAIRS, normalize_pair, pair_index
 
 
-TOM_SCHEMA_VERSION = "tom.v1"
+TOM_SCHEMA_VERSION = "tom.v1_1"
 TASKS = ("first_order", "second_order")
 FIRST_ORDER_MODE = "private_conditioned"
 GUESS_STATUSES = ("ok", "failed")
@@ -39,8 +46,90 @@ COMMON_FIELDS = {
     "label_pair",
     "label_index",
     "guess",
+    "prompt_protocol",
 }
 GUESS_FIELDS = {"status", "raw_text", "error", "attempts", "model"}
+PROMPT_PROTOCOL_FIELDS = {
+    "protocol_version",
+    "language",
+    "protocol_id",
+    "gameplay",
+    "belief",
+    "parser",
+    "runtime",
+}
+PROMPT_REFERENCE_FIELDS = {"version", "sha256"}
+RUNTIME_FIELDS = {"gameplay_profiles", "belief_profiles", "parser"}
+RUNTIME_MODEL_FIELDS = {"backend", "model", "temperature"}
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _validate_runtime_model(value, name):
+    if not isinstance(value, dict) or set(value) != RUNTIME_MODEL_FIELDS:
+        raise ValueError(f"{name} fields do not match the prompt runtime schema")
+    for field in ("backend", "model"):
+        if not isinstance(value[field], str) or not value[field]:
+            raise ValueError(f"{name}.{field} is required")
+    if isinstance(value["temperature"], bool) or not isinstance(
+        value["temperature"], (int, float)
+    ):
+        raise ValueError(f"{name}.temperature must be numeric")
+
+
+def validate_prompt_protocol(prompt_protocol) -> bool:
+    if not isinstance(prompt_protocol, dict) or set(prompt_protocol) != PROMPT_PROTOCOL_FIELDS:
+        raise ValueError("prompt_protocol fields do not match prompt_protocol.zh.v1")
+    if prompt_protocol["protocol_version"] != PROMPT_PROTOCOL_VERSION:
+        raise ValueError("unsupported prompt_protocol version")
+    if prompt_protocol["language"] != PROMPT_LANGUAGE:
+        raise ValueError("prompt_protocol.language must be zh-CN")
+    references = {}
+    for name in PROMPT_NAMES:
+        reference = prompt_protocol[name]
+        if not isinstance(reference, dict) or set(reference) != PROMPT_REFERENCE_FIELDS:
+            raise ValueError(f"prompt_protocol.{name} fields are invalid")
+        if not isinstance(reference["version"], str) or not re.fullmatch(
+            rf"{name}\.zh\.v[1-9][0-9]*", reference["version"]
+        ):
+            raise ValueError(f"prompt_protocol.{name}.version is invalid")
+        if not isinstance(reference["sha256"], str) or not SHA256_PATTERN.fullmatch(
+            reference["sha256"]
+        ):
+            raise ValueError(f"prompt_protocol.{name}.sha256 is invalid")
+        references[name] = reference
+    protocol_id = prompt_protocol["protocol_id"]
+    if not isinstance(protocol_id, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", protocol_id
+    ):
+        raise ValueError("prompt_protocol.protocol_id is invalid")
+    expected_id = protocol_id_from_references(
+        references,
+        protocol_version=prompt_protocol["protocol_version"],
+        language=prompt_protocol["language"],
+    )
+    if protocol_id != expected_id:
+        raise ValueError("prompt_protocol.protocol_id does not match prompt specs")
+
+    runtime = prompt_protocol["runtime"]
+    if not isinstance(runtime, dict) or set(runtime) != RUNTIME_FIELDS:
+        raise ValueError("prompt_protocol.runtime fields are invalid")
+    gameplay_profiles = runtime["gameplay_profiles"]
+    belief_profiles = runtime["belief_profiles"]
+    if not isinstance(gameplay_profiles, dict) or not gameplay_profiles:
+        raise ValueError("prompt runtime requires gameplay_profiles")
+    if not isinstance(belief_profiles, dict) or set(belief_profiles) != set(
+        gameplay_profiles
+    ):
+        raise ValueError("belief_profiles must match gameplay profile names")
+    for profile_name, profile in gameplay_profiles.items():
+        if not isinstance(profile_name, str) or not profile_name:
+            raise ValueError("gameplay profile names must be non-empty text")
+        _validate_runtime_model(profile, f"gameplay_profiles.{profile_name}")
+        _validate_runtime_model(
+            belief_profiles[profile_name], f"belief_profiles.{profile_name}"
+        )
+    _validate_runtime_model(runtime["parser"], "parser runtime")
+    return True
 
 
 def _nullable_player(value, name):
@@ -69,6 +158,7 @@ def validate_sample(sample: dict, *, require_success=True) -> bool:
         )
     if sample["schema_version"] != TOM_SCHEMA_VERSION:
         raise ValueError("unsupported ToM schema_version; legacy samples are rejected")
+    validate_prompt_protocol(sample["prompt_protocol"])
     for name in ("sample_id", "game_id", "checkpoint", "state_id", "phase"):
         if not isinstance(sample[name], str) or not sample[name]:
             raise ValueError(f"{name} is required")
@@ -247,6 +337,7 @@ def make_sample(
     events,
     output_mask,
     guess,
+    prompt_protocol,
     observer_id=None,
     modeler_id=None,
     target_id=None,
@@ -281,6 +372,7 @@ def make_sample(
             "attempts": guess.attempts,
             "model": guess.model,
         },
+        "prompt_protocol": deepcopy(prompt_protocol),
     }
     validate_sample(sample, require_success=False)
     return sample

@@ -1,4 +1,4 @@
-"""Feature construction for strict ``tom.v1`` samples."""
+"""Feature construction for strict ``tom.v1_1`` samples."""
 
 import torch
 
