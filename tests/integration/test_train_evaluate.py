@@ -77,13 +77,13 @@ def test_tiny_train_and_evaluate_smoke(tmp_path):
     )
     assert checkpoint["prompt_protocol"]["prompt_language"] == "zh-CN"
     assert checkpoint["prompt_protocol"]["prompt_protocol_version"] == (
-        "prompt_protocol.zh.v2"
+        "prompt_protocol.zh.v3"
     )
     assert checkpoint["prompt_protocol"]["gameplay_prompt_version"] == (
         "gameplay.zh.v2"
     )
     assert checkpoint["prompt_protocol"]["belief_prompt_version"] == (
-        "belief.zh.v2"
+        "belief.zh.v3"
     )
     assert checkpoint["prompt_protocol"]["parser_prompt_version"] == (
         "parser.zh.v2"

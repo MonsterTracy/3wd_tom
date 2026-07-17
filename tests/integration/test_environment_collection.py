@@ -356,7 +356,7 @@ def test_collection_audit_reports_required_counts_and_fatal_gates():
         records[0]["prompt_protocol"]["protocol_id"]: 2
     }
     assert report["gameplay_prompt_versions"] == ["gameplay.zh.v2"]
-    assert report["belief_prompt_versions"] == ["belief.zh.v2"]
+    assert report["belief_prompt_versions"] == ["belief.zh.v3"]
     assert report["parser_prompt_versions"] == ["parser.zh.v2"]
     assert report["ruleset_ids"] == ["werewolf_7p"]
     assert report["ruleset_versions"] == ["werewolf_7p.zh.v1"]

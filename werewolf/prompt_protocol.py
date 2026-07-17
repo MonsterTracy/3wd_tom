@@ -1,4 +1,4 @@
-"""Canonical Prompt Protocol V2 specifications and stable metadata helpers."""
+"""Canonical Prompt Protocol V3 specifications and stable metadata helpers."""
 
 from copy import deepcopy
 from hashlib import sha256
@@ -16,10 +16,10 @@ from werewolf.game_rules import (
 )
 
 
-PROMPT_PROTOCOL_VERSION = "prompt_protocol.zh.v2"
+PROMPT_PROTOCOL_VERSION = "prompt_protocol.zh.v3"
 PROMPT_LANGUAGE = "zh-CN"
 GAMEPLAY_PROMPT_VERSION = "gameplay.zh.v2"
-BELIEF_PROMPT_VERSION = "belief.zh.v2"
+BELIEF_PROMPT_VERSION = "belief.zh.v3"
 PARSER_PROMPT_VERSION = "parser.zh.v2"
 PROMPT_NAMES = ("gameplay", "belief", "parser")
 
@@ -210,7 +210,8 @@ BELIEF_SYSTEM_PROMPT = """你正在私下测量一名玩家在当前检查点的
 不要生成公开发言。
 不要选择动作。
 不要解释。
-不要输出推理过程。"""
+不要输出推理过程。
+你必须以 json 格式返回结果。"""
 
 BELIEF_USER_TEMPLATE = """【当前被测玩家】
 {observer_id}号
@@ -233,7 +234,7 @@ required_wolves: {required_wolves}
 forbidden_wolves: {forbidden_wolves}
 valid_player_ids: {valid_player_ids}
 
-只返回：
+请只返回一个合法的 json 对象，不要输出 Markdown、解释或额外字段：
 {{"wolf_pair":[1,2]}}
 
 提交前请确认：
@@ -255,7 +256,8 @@ BELIEF_REPAIR_REASONS = {
 BELIEF_REPAIR_TEMPLATE = """{reason}
 已知必须包含的狼人：{required_wolves}。
 禁止选择的玩家：{forbidden_wolves}。
-请只返回满足这些硬约束的合法 JSON。"""
+请只返回满足这些硬约束的合法 json 对象：
+{{"wolf_pair":[1,2]}}"""
 
 
 def render_belief_user_message(

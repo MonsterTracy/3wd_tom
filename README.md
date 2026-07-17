@@ -105,7 +105,7 @@ refuses any path that already exists. Generated JSON/JSONL under `data/tom/` is
 ignored by Git. If the audit fails, samples, failures, and audit output remain in
 that directory for diagnosis, so do not reuse an old pilot directory.
 
-## Ruleset and Prompt Protocol V2
+## Ruleset and Prompt Protocol V3
 
 `werewolf/game_rules.py` is the sole machine-readable game-rule source. The
 current ruleset is `werewolf_7p.zh.v1` (`id: werewolf_7p`) and covers both
@@ -113,16 +113,17 @@ supported seven-player variants, `seer_witch` and `seer_guard`. Prompt text
 renders rules from that module; this README intentionally does not duplicate
 the complete rules.
 
-`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V2. Its formal
+`werewolf/prompt_protocol.py` defines the sole Prompt Protocol V3. Its formal
 instruction language is Chinese (`language: zh-CN`) and it has three canonical
 protocols:
 
 - `gameplay.zh.v2` layers rendered global rules, current-role rules, visibility
   boundaries, and phase tasks. Its dynamic message separates confirmed private
   facts, public objective events, and untrusted public player claims.
-- `belief.zh.v2` measures one player's private joint MAP belief over the complete
-  two-Werewolf pair from the same three information partitions. It does not
-  continue gameplay, affect later actions, or request reasoning.
+- `belief.zh.v3` measures one player's private joint MAP belief over the complete
+  two-Werewolf pair from the same three information partitions. Its canonical
+  messages include the lowercase `json` instruction required by JSON Output. It
+  does not continue gameplay, affect later actions, or request reasoning.
 - `parser.zh.v2` extracts only explicit local speech semantics into the existing
   controlled event vocabulary and includes six fixed Chinese JSON few-shots.
 

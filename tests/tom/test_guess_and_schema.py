@@ -63,10 +63,12 @@ class SequenceBackend:
         self.responses = iter(responses)
         self.calls = 0
         self.messages = []
+        self.kwargs = []
 
     def chat(self, messages, **kwargs):
         self.calls += 1
         self.messages.append(deepcopy(messages))
+        self.kwargs.append(deepcopy(kwargs))
         response = next(self.responses)
         if isinstance(response, BaseException):
             raise response
@@ -90,11 +92,16 @@ def _elicit(provider, *, player_view="view", required=(), forbidden=(3,), mask=N
 
 
 def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
-    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v2"
+    assert PROMPT_PROTOCOL_VERSION == "prompt_protocol.zh.v3"
     assert PROMPT_LANGUAGE == "zh-CN"
+    expected_versions = {
+        "gameplay": "gameplay.zh.v2",
+        "belief": "belief.zh.v3",
+        "parser": "parser.zh.v2",
+    }
     for name, spec in CANONICAL_PROMPT_SPECS.items():
         assert spec["name"] == name
-        assert spec["version"] == f"{name}.zh.v2"
+        assert spec["version"] == expected_versions[name]
         assert re.search(r"[\u4e00-\u9fff]", spec["text"])
         assert len(re.findall(r"[\u4e00-\u9fff]", spec["text"])) > 40
         assert "You are" not in spec["text"]
@@ -116,8 +123,20 @@ def test_prompt_protocol_hashes_and_id_are_stable_and_content_addressed():
     assert canonical_ruleset_metadata() == {
         "id": RULESET_ID,
         "version": RULESET_VERSION,
-        "sha256": canonical_ruleset_metadata()["sha256"],
+        "sha256": "7d45ee4a8957001b6c2ea44c3b9ec9afba99fe1235ad07147d6c6c1ccd9a6bc1",
     }
+    assert GAMEPLAY_PROMPT_SPEC["sha256"] == (
+        "06f5b4865163af4ccad8c90e77525a8f95fe578ca45fcbd47f52946381506adc"
+    )
+    assert PARSER_PROMPT_SPEC["sha256"] == (
+        "8f796886879c3303feffa3ecf9915eeaf07ea6ce817433ba8a1734ea59ca84f7"
+    )
+    assert BELIEF_PROMPT_SPEC["sha256"] != (
+        "926c54a36358f0d8848f0d7591000e152988420eea8b929880baa653881c6dab"
+    )
+    assert first != (
+        "sha256:9e6ea40cedb78638d5fd9d3f66dbeb6bb8a3f6c6a15c44d59b68865d2453591e"
+    )
     assert '{"wolf_pair":[1,2]}' in json.loads(
         BELIEF_PROMPT_SPEC["text"]
     )["user_template"]
@@ -324,9 +343,44 @@ def test_belief_prompt_encodes_joint_map_semantics_and_injection_boundary():
     assert "不要选择动作" in prompt
     assert "不要生成公开发言" in prompt
     assert "不要解释" in prompt
-    assert prompt.count("wolf_pair") == 1
+    assert prompt.count("wolf_pair") == 2
+    assert "guessed_wolf_pair" not in prompt
     assert "21" not in json.loads(prompt)["user_template"]
     assert PARSER_PROMPT_SPEC["text"] != prompt
+
+
+def test_belief_json_mode_messages_contain_lowercase_json_instruction():
+    backend = SequenceBackend(["bad", '{"wolf_pair":[1,2]}'])
+    result = _elicit(BeliefGuessProvider(backend, "agent-model"))
+
+    assert result.status == "ok"
+    assert result.pair == (1, 2)
+    initial_messages = backend.messages[0]
+    repair_messages = backend.messages[1]
+    assert "json" in initial_messages[0]["content"]
+    assert "json" in initial_messages[1]["content"]
+    assert "json" in "\n".join(message["content"] for message in initial_messages)
+    assert "json" in repair_messages[-1]["content"]
+    assert "json" in "\n".join(message["content"] for message in repair_messages)
+    assert '{"wolf_pair":[1,2]}' in initial_messages[1]["content"]
+    assert '{"wolf_pair":[1,2]}' in repair_messages[-1]["content"]
+    assert "guessed_wolf_pair" not in "\n".join(
+        message["content"] for message in repair_messages
+    )
+    assert backend.kwargs == [
+        {
+            "model": "agent-model",
+            "temperature": 0.0,
+            "max_tokens": 40,
+            "response_format": {"type": "json_object"},
+        },
+        {
+            "model": "agent-model",
+            "temperature": 0.0,
+            "max_tokens": 40,
+            "response_format": {"type": "json_object"},
+        },
+    ]
 
 
 def test_guess_provider_repairs_once_without_defaulting():
@@ -713,6 +767,22 @@ def test_prompt_protocol_schema_rejects_missing_invalid_and_unknown_metadata(tmp
     old_path.write_text(json.dumps(old_english) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="unsupported prompt_protocol"):
         ToMDataset(old_path)
+
+    old_v2 = deepcopy(record)
+    old_v2["prompt_protocol"].update(
+        protocol_version="prompt_protocol.zh.v2",
+        protocol_id=(
+            "sha256:9e6ea40cedb78638d5fd9d3f66dbeb6bb8a3f6c6a15c44d59b68865d2453591e"
+        ),
+    )
+    old_v2["prompt_protocol"]["belief"] = {
+        "version": "belief.zh.v2",
+        "sha256": "926c54a36358f0d8848f0d7591000e152988420eea8b929880baa653881c6dab",
+    }
+    old_v2_path = tmp_path / "old-v2.jsonl"
+    old_v2_path.write_text(json.dumps(old_v2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported prompt_protocol"):
+        ToMDataset(old_v2_path)
 
     mixed = deepcopy(record)
     mixed["sample_id"] = "fixture:first:mixed-protocol"

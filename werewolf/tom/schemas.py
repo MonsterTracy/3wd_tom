@@ -93,7 +93,7 @@ def _validate_runtime_model(value, name):
 
 def validate_prompt_protocol(prompt_protocol) -> bool:
     if not isinstance(prompt_protocol, dict) or set(prompt_protocol) != PROMPT_PROTOCOL_FIELDS:
-        raise ValueError("prompt_protocol fields do not match prompt_protocol.zh.v2")
+        raise ValueError("prompt_protocol fields do not match prompt_protocol.zh.v3")
     if prompt_protocol["protocol_version"] != PROMPT_PROTOCOL_VERSION:
         raise ValueError("unsupported prompt_protocol version")
     if prompt_protocol["language"] != PROMPT_LANGUAGE:
