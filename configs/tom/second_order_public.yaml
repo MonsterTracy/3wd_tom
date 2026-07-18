@@ -1,4 +1,4 @@
-schema_version: train.v1
+schema_version: train.v2
 data:
   train_paths: [data/game_001/game_001.samples.jsonl]
   valid_paths: [data/game_002/game_002.samples.jsonl]
@@ -19,6 +19,7 @@ training:
   batch_size: 64
   learning_rate: 0.0003
   weight_decay: 0.01
+  marginal_bce_weight: 0.0
   seed: 20260716
   device: auto
   output_dir: artifacts/tom/second_order_public

@@ -48,3 +48,35 @@ def compute_metrics(logits, labels, output_mask, *, top_k=3):
         ).pow(2).sum(dim=1).mean().item(),
         "player_marginal_mae": (marginals - true_pair).abs().mean().item(),
     }
+
+
+def compute_player_distribution_metrics(logits, labels, output_mask):
+    """Return normalized player metrics used only by offline evaluation."""
+    probabilities = pair_probabilities(logits, output_mask)
+    marginals = player_marginals(probabilities)
+    target_membership = PAIR_MEMBERSHIP.to(
+        device=logits.device, dtype=probabilities.dtype
+    )[labels.to(logits.device)]
+    predicted_distribution = marginals / 2
+    target_distribution = target_membership / 2
+    log_prediction = predicted_distribution.clamp_min(1e-12).log()
+    log_target = target_distribution.clamp_min(1e-12).log()
+    top_players = marginals.topk(2, dim=1).indices
+    return {
+        "normalized_player_marginal_kl": (
+            target_distribution * (log_target - log_prediction)
+        ).sum(dim=1).mean().item(),
+        "normalized_player_marginal_cross_entropy": (
+            -(target_distribution * log_prediction).sum(dim=1).mean().item()
+        ),
+        "player_marginal_brier": (
+            (predicted_distribution - target_distribution)
+            .pow(2)
+            .sum(dim=1)
+            .mean()
+            .item()
+        ),
+        "player_top2_recall": (
+            target_membership.gather(1, top_players).sum(dim=1).div(2).mean().item()
+        ),
+    }

@@ -181,8 +181,42 @@ used. GRU and bag-of-events MLP remain explicit ablations. `model.v2`
 checkpoints record the exact Transformers version and GPT-2 structure and are
 not compatible with the former TransformerEncoder `model.v1` checkpoints. The
 conditioning ablations remove first-order private events or second-order target
-embeddings. All configurations still optimize one masked 21-class
-cross-entropy objective.
+embeddings. The canonical primary objective remains masked 21-class pair
+cross-entropy. Strict `train.v2` configurations add one optional auxiliary:
+`total_loss = pair_cross_entropy + marginal_bce_weight * marginal_bce`, with
+`marginal_bce_weight: 0.0` as the canonical default. The auxiliary does not add
+a player-output head or replace the pair objective.
+
+Evaluation keeps that 21-class distribution over unordered Werewolf pairs as
+the model's primary output. It also deterministically marginalizes the joint
+distribution to seven player probabilities: each value is the probability that
+the corresponding player belongs to the predicted pair, so the seven values
+sum to 2, not 1, and no player softmax is applied. Marginal BCE compares these
+seven values directly with the elicited pair's seven-player two-hot target. It
+is distinct from normalized marginal KL/cross entropy, which divide the
+marginals by 2 and assign 0.5 to each elicited player. Raw pair CE and marginal
+BCE values should not be compared as if they were on the same scale.
+In addition to pair NLL, accuracy, top-3 accuracy, Brier score, and player
+marginal MAE, evaluation reports normalized player-marginal KL and cross
+entropy, player-marginal Brier, top-2 recall, and the same two-hot player
+marginal BCE used by the optional auxiliary.
+
+Training history records pair, marginal, and total losses separately for train
+and validation. Best-checkpoint selection always uses validation pair
+cross-entropy (`valid_pair_loss`), never total loss or marginal BCE, so weights
+remain comparable on the primary pair objective. The five-game marginal-BCE
+experiments are smoke ablations only and are not research conclusions.
+
+Every eval writes the aggregate `evaluation.json` plus
+`evaluation.predictions.jsonl` (derived from the configured output stem). Each
+prediction row contains the 21-way boolean `output_mask`, masked pair
+probabilities, and their seven player marginals. Its `elicited_label_pair` is
+the target player's independently
+elicited subjective belief, never the environment's true roles: first-order
+uses the observer's legal view and own elicitation; second-order `public_only`
+uses public history and a target; second-order `wolf_conditioned` uses the wolf
+modeler's legal view and a target. Both second-order labels remain the target's
+elicited pair. No objective role table or actual wolf pair is exported.
 
 ## Data contract
 

@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,17 @@ from werewolf.events.encoder import EVENT_TOKEN_FIELDS, VOCABULARIES
 from werewolf.tom.collection import build_audit_report
 from werewolf.tom.dataset import ToMDataset
 from werewolf.tom.features import collate_features
-from werewolf.tom.losses import masked_pair_cross_entropy
-from werewolf.tom.metrics import compute_metrics, pair_probabilities, player_marginals
+from werewolf.tom.losses import (
+    compute_training_losses,
+    masked_pair_cross_entropy,
+    player_marginal_binary_cross_entropy,
+)
+from werewolf.tom.metrics import (
+    compute_metrics,
+    compute_player_distribution_metrics,
+    pair_probabilities,
+    player_marginals,
+)
 from werewolf.tom.model import ARCHITECTURES, ToMModel, ToMModelConfig
 
 
@@ -244,11 +254,11 @@ def test_conditioning_and_target_ablation_behavior_remain_explicit():
 def test_gpt2block_mps_forward_backward_without_fallback():
     model = _small_model().to("mps")
     batch = {key: value.to("mps") for key, value in _synthetic_batch().items()}
-    loss = masked_pair_cross_entropy(
-        model(batch), batch["labels"], batch["output_mask"]
+    losses = compute_training_losses(
+        model(batch), batch["labels"], batch["output_mask"], 0.25
     )
-    loss.backward()
-    assert torch.isfinite(loss).item()
+    losses["total_loss"].backward()
+    assert all(torch.isfinite(loss).item() for loss in losses.values())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
@@ -258,9 +268,86 @@ def test_gpt2block_cuda_forward():
     assert model(batch).shape == (2, 21)
 
 
-def test_player_marginals_sum_to_two():
-    probabilities = torch.full((3, 21), 1 / 21)
-    assert torch.allclose(player_marginals(probabilities).sum(1), torch.full((3,), 2.0))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_player_marginals_sum_to_two_and_stay_in_unit_interval(dtype):
+    probabilities = torch.full((3, 21), 1 / 21, dtype=dtype)
+    marginals = player_marginals(probabilities)
+    assert marginals.shape == (3, 7)
+    assert torch.allclose(
+        marginals.sum(1), torch.full((3,), 2.0, dtype=dtype)
+    )
+    assert torch.allclose(marginals, torch.full((3, 7), 2 / 7, dtype=dtype))
+    assert torch.all((marginals >= 0) & (marginals <= 1))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_single_pair_probability_has_two_hot_player_marginals(dtype):
+    probabilities = torch.zeros(1, 21, dtype=dtype)
+    probabilities[0, 0] = 1
+    assert torch.equal(
+        player_marginals(probabilities),
+        torch.tensor([[1, 1, 0, 0, 0, 0, 0]], dtype=dtype),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_evaluation_only_player_distribution_metrics(dtype):
+    logits = torch.full((1, 21), -100.0, dtype=dtype)
+    logits[0, 0] = 100.0
+    labels = torch.tensor([0])
+    mask = torch.ones(1, 21, dtype=torch.bool)
+
+    metrics = compute_player_distribution_metrics(logits, labels, mask)
+
+    assert metrics["normalized_player_marginal_kl"] == pytest.approx(0.0, abs=1e-7)
+    assert metrics["normalized_player_marginal_cross_entropy"] == pytest.approx(
+        math.log(2), abs=1e-6
+    )
+    assert metrics["player_marginal_brier"] == pytest.approx(0.0, abs=1e-7)
+    assert metrics["player_top2_recall"] == pytest.approx(1.0)
+
+
+def test_uniform_player_distribution_metrics_have_expected_kl_and_cross_entropy():
+    logits = torch.zeros(1, 21, dtype=torch.float64)
+    labels = torch.tensor([0])
+    mask = torch.ones(1, 21, dtype=torch.bool)
+
+    metrics = compute_player_distribution_metrics(logits, labels, mask)
+
+    assert metrics["normalized_player_marginal_cross_entropy"] == pytest.approx(
+        math.log(7)
+    )
+    assert metrics["normalized_player_marginal_kl"] == pytest.approx(
+        math.log(7 / 2)
+    )
+
+
+def test_player_brier_and_top2_recall_use_normalized_two_player_distributions():
+    logits = torch.full((1, 21), -100.0, dtype=torch.float64)
+    logits[0, 1] = 100.0  # predicts [1,3] while the elicited pair is [1,2]
+    metrics = compute_player_distribution_metrics(
+        logits,
+        torch.tensor([0]),
+        torch.ones(1, 21, dtype=torch.bool),
+    )
+    assert metrics["player_marginal_brier"] == pytest.approx(0.5)
+    assert metrics["player_top2_recall"] == pytest.approx(0.5)
+
+
+def test_training_metrics_do_not_include_evaluation_only_player_metrics():
+    metrics = compute_metrics(
+        torch.zeros(1, 21),
+        torch.tensor([0]),
+        torch.ones(1, 21, dtype=torch.bool),
+    )
+    assert set(metrics) == {
+        "samples",
+        "pair_accuracy",
+        "pair_top_3_accuracy",
+        "negative_log_likelihood",
+        "pair_brier",
+        "player_marginal_mae",
+    }
 
 
 def test_loss_rejects_a_label_masked_by_knowledge():
@@ -272,12 +359,99 @@ def test_loss_rejects_a_label_masked_by_knowledge():
         masked_pair_cross_entropy(logits, labels, mask)
 
 
+def test_zero_marginal_weight_exactly_preserves_pair_loss_and_gradients():
+    torch.manual_seed(19)
+    mask = torch.ones(2, 21, dtype=torch.bool)
+    labels = torch.tensor([0, 8])
+    legacy_logits = torch.randn(2, 21, dtype=torch.float64, requires_grad=True)
+    combined_logits = legacy_logits.detach().clone().requires_grad_(True)
+
+    legacy_loss = masked_pair_cross_entropy(legacy_logits, labels, mask)
+    legacy_loss.backward()
+    losses = compute_training_losses(combined_logits, labels, mask, 0.0)
+    losses["total_loss"].backward()
+
+    assert torch.equal(losses["pair_loss"], legacy_loss.detach())
+    assert torch.equal(losses["total_loss"], legacy_loss.detach())
+    assert torch.equal(combined_logits.grad, legacy_logits.grad)
+
+
+def test_perfect_pair_has_near_zero_pair_and_marginal_losses():
+    logits = torch.zeros(1, 21, dtype=torch.float64)
+    labels = torch.tensor([8])
+    mask = torch.zeros(1, 21, dtype=torch.bool)
+    mask[0, 8] = True
+    losses = compute_training_losses(logits, labels, mask, 0.5)
+    assert losses["pair_loss"].item() == pytest.approx(0.0)
+    assert losses["marginal_bce"].item() == pytest.approx(0.0, abs=2e-7)
+    assert torch.isfinite(losses["total_loss"])
+
+
+def test_uniform_pair_distribution_has_exact_expected_marginal_bce():
+    marginal_bce = player_marginal_binary_cross_entropy(
+        torch.zeros(1, 21, dtype=torch.float64),
+        torch.tensor([0]),
+        torch.ones(1, 21, dtype=torch.bool),
+    )
+    assert marginal_bce.item() == pytest.approx(0.5982695885852573)
+
+
+def test_one_shared_player_has_lower_marginal_bce_than_disjoint_pair():
+    label_index = 0  # [1,2]
+
+    def marginal_bce_for(alternative_index):
+        logits = torch.zeros(1, 21, dtype=torch.float64)
+        mask = torch.zeros(1, 21, dtype=torch.bool)
+        mask[0, [label_index, alternative_index]] = True
+        logits[0, alternative_index] = math.log(9)
+        return player_marginal_binary_cross_entropy(
+            logits, torch.tensor([label_index]), mask
+        )
+
+    shared = marginal_bce_for(1)  # [1,3]
+    disjoint = marginal_bce_for(11)  # [3,4]
+    assert shared < disjoint
+
+
+def test_dynamic_mask_marginal_loss_and_gradients_are_finite():
+    torch.manual_seed(23)
+    logits = torch.randn(2, 21, requires_grad=True)
+    labels = torch.tensor([0, 8])
+    mask = torch.zeros(2, 21, dtype=torch.bool)
+    mask[0, [0, 1, 5]] = True
+    mask[1, [8, 9, 20]] = True
+    losses = compute_training_losses(logits, labels, mask, 0.25)
+    probabilities = pair_probabilities(logits, mask)
+    marginals = player_marginals(probabilities)
+    losses["total_loss"].backward()
+    assert torch.equal(probabilities[~mask], torch.zeros_like(probabilities[~mask]))
+    assert torch.allclose(marginals.sum(1), torch.full((2,), 2.0))
+    assert all(torch.isfinite(loss) for loss in losses.values())
+    assert torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.parametrize("weight", [0.0, 0.1, 0.25, 0.5])
+def test_total_loss_uses_exact_marginal_weight_formula(weight):
+    losses = compute_training_losses(
+        torch.linspace(-1, 1, 21, dtype=torch.float64).unsqueeze(0),
+        torch.tensor([0]),
+        torch.ones(1, 21, dtype=torch.bool),
+        weight,
+    )
+    assert torch.equal(
+        losses["total_loss"],
+        losses["pair_loss"] + weight * losses["marginal_bce"],
+    )
+
+
 def test_torch_masked_probabilities_are_normalized_and_exactly_zero_when_invalid():
     logits = torch.linspace(-2, 2, 42).reshape(2, 21)
     mask = torch.zeros(2, 21, dtype=torch.bool)
     mask[0, [0, 5]] = True
     mask[1, [3, 8, 20]] = True
     probabilities = pair_probabilities(logits, mask)
+    assert probabilities.shape == (2, 21)
     assert torch.all(probabilities >= 0)
     assert torch.allclose(probabilities.sum(1), torch.ones(2))
     assert torch.equal(probabilities[~mask], torch.zeros_like(probabilities[~mask]))
+    assert mask.gather(1, probabilities.argmax(dim=1, keepdim=True)).all()
